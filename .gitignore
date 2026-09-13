@@ -1,0 +1,11 @@
+build/
+*.o
+*.bin
+*.pe
+*.map
+*.vmem
+*.vmss
+*.vmsd
+*.nvram
+*.lck/
+*.log

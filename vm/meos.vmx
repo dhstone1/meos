@@ -1,0 +1,25 @@
+.encoding = "UTF-8"
+config.version = "8"
+virtualHW.version = "20"
+
+displayName = "MeOS"
+guestOS = "other"
+memsize = "256"
+numvcpus = "1"
+firmware = "bios"
+
+bios.bootOrder = "cdrom"
+bios.bootDelay = "1500"
+
+floppy0.present = "FALSE"
+usb.present = "FALSE"
+sound.present = "FALSE"
+ethernet0.present = "FALSE"
+serial0.present = "FALSE"
+parallel0.present = "FALSE"
+
+ide1:0.present = "TRUE"
+ide1:0.deviceType = "cdrom-image"
+ide1:0.fileName = "meos.iso"
+ide1:0.startConnected = "TRUE"
+ide1:0.autodetect = "FALSE"
