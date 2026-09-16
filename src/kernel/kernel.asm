@@ -88,6 +88,31 @@ D_KB_HIST   equ 0x64               ; 8 个 dword：最近 8 个原始扫描码�
 D_CONPIX   equ 0x84               ; dword 整屏白像素数（自检用）
 D_ROWPIX    equ 0x88               ; 25 个 dword：每个文字行各有多少个白像素
 
+; 网络（详见 net.inc）
+D_NET_STAGE   equ 0x100            ; dword 网卡初始化进度（0..9）
+D_NET_VENDOR  equ 0x104            ; dword PCI vendor id
+D_NET_DEVICE  equ 0x108            ; dword PCI device id
+D_NET_BUSDEV  equ 0x10C            ; dword 设备号<<11 | 功能号<<8
+D_NET_MMIO    equ 0x110            ; dword BAR0（MMIO 基址）
+D_NET_IRQ     equ 0x114            ; dword PCI 中断线
+D_NET_MAC     equ 0x118            ; 6 字节 MAC
+D_NET_LINK    equ 0x120            ; dword 链路状态寄存器
+D_NET_TX      equ 0x124            ; dword 发出的以太网帧数
+D_NET_RX      equ 0x128            ; dword 收到的以太网帧数
+D_NET_GWMAC   equ 0x12C            ; 6 字节 网关 MAC
+D_NET_ARP_RX  equ 0x134            ; dword 收到的 ARP 应答数
+D_NET_ICMP_TX equ 0x138            ; dword 发出的 ICMP 请求数
+D_NET_ICMP_RX equ 0x13C            ; dword 收到的 ICMP 应答数
+D_NET_DNS_IP  equ 0x140            ; dword DNS 解析出的 IP
+D_NET_DNS_OK  equ 0x144            ; dword 1 = 解析成功
+D_NET_LASTIP  equ 0x148            ; dword 最近一次 ping 的目标
+D_NET_RTT     equ 0x14C            ; dword 最近一次 ping 的往返毫秒
+D_NET_LOCALIP equ 0x150            ; dword 本机 IP
+D_NET_ERR     equ 0x154            ; dword 最近一次错误码
+D_NET_SCAN    equ 0x158            ; 8 个 dword：总线 0 上扫到的前 8 个设备（vendor | device<<16）
+D_NET_PKTLEN  equ 0x180            ; dword 最近收到那一帧的长度
+D_NET_PKT     equ 0x184            ; 16 个 dword：最近收到那一帧的前 64 字节
+
 ; ============================================================================
 ;  一、16 位实模式
 ; ============================================================================
@@ -389,6 +414,7 @@ pm_entry:
     call setup_idt                      ; 兜底门 + 键盘 / 定时器两个真门
     mov dword [DIAG_ADDR + D_STAGE], 1
     call probe_hardware
+    call net_probe                      ; 找网卡，先把 PCI 信息记下来
     mov dword [DIAG_ADDR + D_STAGE], 2
     call con_init
     call clear_screen
@@ -404,7 +430,9 @@ pm_entry:
     call diag_snapshot                  ; 开机时的状态先记一次：没输入时它就不会变了
     call verify_console                 ; 开机就把自己画的东西数一遍，写进诊断块
     mov dword [DIAG_ADDR + D_STAGE], 6
+    call pit_init_1000                  ; 定时器改成 1000Hz，tick 即毫秒
     sti                                 ; 到这里一切都就绪了，可以开中断
+    call net_start                      ; 网络启用（要等中断开了才能计时）
     jmp shell_loop
 
 ; ---- 读 SVGA 寄存器：EAX = 寄存器号 -> EAX = 值 --------------------------------
@@ -697,12 +725,24 @@ pic_remap:
     popad
     ret
 
+; ---- 把 PIT 调到 1000Hz：这样 D_TICKS 就是毫秒 --------------------------------
+;  默认 18.2Hz 太粗，ping 的往返时间根本量不出来。通道 0、模式 3（方波）、
+;  除数 = 1193182 / 1000 = 1193。
+pit_init_1000:
+    mov al, 0x36                        ; 通道0 | 先低后高 | 模式3 | 二进制
+    out 0x43, al
+    mov ax, 1193
+    out 0x40, al                        ; 低字节
+    mov al, ah
+    out 0x40, al                        ; 高字节
+    ret
+
 ; ---- 定时器中断（IRQ0 -> INT 0x20）：数节拍，顺带让光标闪 --------------------
 timer_isr:
     pushad
     inc dword [DIAG_ADDR + D_TICKS]
     mov eax, [DIAG_ADDR + D_TICKS]
-    test eax, 7                         ; PIT 默认 18.2Hz，8 个节拍约 0.44 秒
+    test eax, 511                       ; PIT 现在是 1000Hz，512 拍约 0.51 秒
     jnz .eoi
     cmp byte [cur_visible], 0
     je .paint
@@ -1166,8 +1206,10 @@ con_putc:
 ;  con_newline 只管把位置挪到下一行，它不碰光标——光标是 con_putc 的事。
 ;  上层想换行必须用这个，否则光标横杠会留在原地没人擦。
 con_crlf:
-    mov al, 13
-    call con_putc
+    push eax                            ; 必须保护 EAX：调用方常常刚算出一个值，
+    mov al, 13                          ; 紧接着就要换行，EAX 被回车符冲掉的话
+    call con_putc                       ; 会变成很难查的错（踩过：IP 首字节被改成 13）
+    pop eax
     ret
 
 ; ---- 输出一个以 0 结尾的字符串：ESI = 字符串 ---------------------------------
@@ -1376,6 +1418,36 @@ shell_exec:
     jnz .cls
 
     mov esi, line_buf
+    mov edi, cmd_ping
+    call str_eq
+    test eax, eax
+    jz .try_ping
+    mov esi, msg_ping_usage
+    call con_puts
+    call con_crlf
+    jmp .done
+.try_ping:
+    mov esi, line_buf
+    mov edi, cmd_ping
+    mov ecx, 4
+    call str_n_eq
+    test eax, eax
+    jz .try_net
+    cmp byte [line_buf + 4], ' '
+    jne .try_net
+    mov esi, line_buf + 5
+    call cmd_do_ping
+    jmp .done
+.try_net:
+    mov esi, line_buf
+    mov edi, cmd_net
+    call str_eq
+    test eax, eax
+    jz .try_echo
+    call cmd_do_net
+    jmp .done
+.try_echo:
+    mov esi, line_buf
     mov edi, cmd_echo
     mov ecx, 4
     call str_n_eq
@@ -1545,34 +1617,90 @@ con_rows    dd 0
 con_ch      db 0
 cur_visible db 0
 
+; 网卡（net.inc 用）
+nic_found   dd 0
+nic_vendor  dd 0
+nic_device  dd 0
+nic_busdev  dd 0
+nic_mmio    dd 0
+nic_irq     dd 0
+nic_mac     times 8 db 0            ; 本机 MAC（后 2 字节是填充）
+nic_rx_cur  dd 0                    ; 接收环里下一个要看的描述符
+nic_tx_cur  dd 0                    ; 发送环里下一个要用的描述符
+nic_rx_len  dd 0                    ; 上一次收包的长度
+arp_target  dd 0                    ; 正在解析的目标 IP
+arp_ok      dd 0                    ; 解析成功没有
+out_mac     times 8 db 0            ; 解析出来的 MAC（后 2 字节填充）
+gw_mac      times 8 db 0            ; 网关 MAC 缓存
+gw_mac_valid dd 0                   ; 网关 MAC 有效没有
+ping_ip     dd 0                    ; 正在 ping 的目标 IP
+ping_seq    dd 0                    ; ICMP 序号
+ping_t0     dd 0                    ; 发出时刻（毫秒）
+dns_ip2     dd 0                    ; DNS 解析出来的 IP
+dns_ok2     dd 0                    ; 解析成功没有
+dns_t0      dd 0                    ; DNS 发出时刻
+dns_name_len dd 0                   ; 编码后的域名长度
+dns_name_buf times 128 db 0         ; DNS 名字（长度前缀格式）
+dns_query_len dd 0                  ; DNS 查询总长
+ping_host   dd 0                    ; 命令行传进来的目标字符串
+ping_ok     dd 0                    ; 这一轮收到几个应答
+ping_n      dd 0                    ; 这一轮发了几个
+
 line_buf    times LINE_MAX db 0
 line_len    dd 0
 
 
 %ifdef SELFTEST
-; 预置的扫描码流，对应的正是这四行：
+; 预置的扫描码流，对应的正是这六行：
 ;   help
 ;   echo typing works
 ;   MeOS 1234
 ;   ver
+;   ping baidu.com
+;   net
 selftest_ptr  dd 0
 selftest_verified db 0
-selftest_len  equ 43
+selftest_len  equ 62
 selftest_data:
     db 0x23, 0x12, 0x26, 0x19, 0x1C, 0x12, 0x2E, 0x23, 0x18, 0x39, 0x14, 0x15
     db 0x19, 0x17, 0x31, 0x22, 0x39, 0x11, 0x18, 0x13, 0x25, 0x1F, 0x1C, 0x2A
     db 0x32, 0xAA, 0x12, 0x2A, 0x18, 0xAA, 0x2A, 0x1F, 0xAA, 0x39, 0x02, 0x03
-    db 0x04, 0x05, 0x1C, 0x2F, 0x12, 0x13, 0x1C
+    db 0x04, 0x05, 0x1C, 0x2F, 0x12, 0x13, 0x1C, 0x19, 0x17, 0x31, 0x22, 0x39
+    db 0x30, 0x1E, 0x17, 0x20, 0x16, 0x34, 0x2E, 0x18, 0x32, 0x1C, 0x31, 0x12
+    db 0x14, 0x1C
 %endif
 
 msg_prompt  db "meos> ", 0
-msg_help    db "commands: help  ver  echo <text>  cls", 0
+msg_help    db "commands: help  ver  echo <text>  cls  net  ping <host>", 0
 msg_ver     db "MeOS 0.2 (M2) - 32-bit protected mode, PS/2 keyboard", 0
 msg_unknown db "unknown command: ", 0
 cmd_help    db "help", 0
 cmd_ver     db "ver", 0
 cmd_cls     db "cls", 0
 cmd_echo    db "echo", 0
+cmd_ping    db "ping", 0
+cmd_net     db "net", 0
+msg_ping_usage db "usage: ping <host|ip>", 0
+
+msg_resolving db "resolving ", 0
+msg_dots      db " ... ", 0
+msg_dns_fail  db "cannot resolve host", 0
+msg_pinging   db "Pinging ", 0
+msg_reply     db "Reply from ", 0
+msg_time      db ": time=", 0
+msg_ms        db "ms", 0
+msg_timeout   db "Request timed out", 0
+msg_stat_a    db "packets: sent=", 0
+msg_stat_b    db ", received=", 0
+msg_net_ip    db "ip      ", 0
+msg_net_gw    db "gateway ", 0
+msg_net_dns   db "dns     ", 0
+msg_net_mask  db "netmask ", 0
+msg_net_mac   db "mac     ", 0
+msg_net_link  db "link    ", 0
+msg_up        db "up", 0
+msg_down      db "down", 0
+msg_net_cnt   db "  tx/rx ", 0
 
 hex_digits  db "0123456789ABCDEF", 0
 msg_vbe_fail db "VBE not available", 13, 10, 0
@@ -1585,5 +1713,6 @@ msg_sep      db 13, 10, "  H     = 0x", 0
 msg_lbl_pix  db 13, 10, "  PIXB  = 0x", 0
 msg_crlf     db 13, 10, 0
 
+%include "net.inc"
 %include "font.inc"
 %include "ascii.inc"

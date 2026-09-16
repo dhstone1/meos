@@ -168,6 +168,12 @@ def main():
 
     # ---- 按命令行主循环的规则把这台会话重放一遍 ----
     screen = [[" "] * cols for _ in range(rows)]
+    # ping / net 的输出里有往返时间、计数器这类每次都变的数字，
+    # 这些行没法逐像素预测，标出来，对账时跳过（但行数必须对，
+    # 否则下面的排版就全错了）。
+    var = [False] * rows
+    varying = [False]
+    scrolled = [0]                      # 滚屏次数，横幅要跟着一起上移
     state = {"x": 0, "y": top_row}
 
     def newline():
@@ -176,6 +182,9 @@ def main():
         if state["y"] >= rows:
             screen.pop(0)
             screen.append([" "] * cols)
+            var.pop(0)                  # var 必须跟着一起滚，否则标记会错位
+            var.append(False)
+            scrolled[0] += 1
             state["y"] = rows - 1
 
     def putc(ch):
@@ -187,6 +196,8 @@ def main():
                 screen[state["y"]][state["x"]] = " "
         elif first <= ord(ch) <= first + count - 1:
             screen[state["y"]][state["x"]] = ch
+            if varying[0]:
+                var[state["y"]] = True
             state["x"] += 1
             if state["x"] >= cols:
                 newline()
@@ -207,6 +218,23 @@ def main():
                 for i in range(cols):
                     r[i] = " "
             state["x"] = state["y"] = 0
+        elif line == "net":
+            varying[0] = True
+            puts("ip      255.255.255.255"); newline()
+            puts("gateway 255.255.255.255"); newline()
+            puts("dns     255.255.255.255"); newline()
+            puts("netmask 255.255.255.255"); newline()
+            puts("mac     FF:FF:FF:FF:FF:FF"); newline()
+            puts("link    down  tx/rx 000/000"); newline()
+            varying[0] = False
+        elif line.startswith("ping"):
+            varying[0] = True
+            puts("resolving x ... 255.255.255.255"); newline()
+            puts("Pinging 255.255.255.255"); newline()
+            for _ in range(4):
+                puts("Reply from 255.255.255.255: time=999ms"); newline()
+            puts("packets: sent=4, received=4"); newline()
+            varying[0] = False
         elif line.startswith("echo") and (len(line) == 4 or line[4] == " "):
             puts(line[5:] if len(line) > 4 else ""); newline()
         else:
@@ -242,12 +270,21 @@ def main():
     font_glyph_len = eq_value(font_inc, "FONT_GLYPH_LEN")
     font_char_num = eq_value(font_inc, "FONT_CHAR_NUM")
     banner_y = eq_value(asm, "BANNER_Y")
+    # 横幅是直接画在显存里的，控制台每滚一行，它就整体上移一个文字行的高度。
+    # 滚出屏幕顶部的那些扫描线就不该再算了。
     banner_rows = [0] * rows
+    shift = scrolled[0] * cell_h
     for g in range(font_char_num):
         base = g * font_glyph_len
         for r in range(glyph_h):
+            y = banner_y + r - shift
+            if y < 0:
+                continue
+            band = y // cell_h
+            if band >= rows:
+                continue
             seg = font_raw[base + r * glyph_row_bytes:base + (r + 1) * glyph_row_bytes]
-            banner_rows[(banner_y + r) // cell_h] += sum(bin(b).count("1") for b in seg)
+            banner_rows[band] += sum(bin(b).count("1") for b in seg)
 
     row_expected = [sum(bits[c] for c in row if c != " ") for row in screen]
     for i in range(rows):
@@ -266,14 +303,23 @@ def main():
     print("")
     print("逐行对账（行: 期望 / 实际 / 差）：")
     bad = 0
+    skipped = 0
     for i in range(rows):
         if row_expected[i] or row_actual[i]:
+            if var[i]:
+                skipped += 1
+                print("  %2d:   (含可变数字，跳过)" % i)
+                continue
             d = row_actual[i] - row_expected[i]
             flag = "" if d == 0 else "   <-- 差 %d" % d
             if d:
                 bad += 1
             print("  %2d: %5d / %5d%s" % (i, row_expected[i], row_actual[i], flag))
-    print("  逐行核对：%s" % ("全部对上" if bad == 0 else "%d 行对不上" % bad))
+    print("  逐行核对：%s%s" % ("全部对上" if bad == 0 else "%d 行对不上" % bad,
+                            "（跳过 %d 行含可变数字的）" % skipped if skipped else ""))
+    # 总数只算能预测的那些行
+    expected = sum(v for k, v in enumerate(row_expected) if not var[k])
+    actual = sum(v for k, v in enumerate(row_actual) if not var[k])
     print("")
     print("横幅字模置位数 = %d" % banner_bits)
     print("宿主机重算期望 = %d" % expected)

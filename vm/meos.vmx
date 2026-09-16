@@ -14,9 +14,16 @@ bios.bootDelay = "1500"
 floppy0.present = "FALSE"
 usb.present = "FALSE"
 sound.present = "FALSE"
-ethernet0.present = "FALSE"
 serial0.present = "FALSE"
 parallel0.present = "FALSE"
+
+# 网卡：e1000（Intel 82540EM）。VMware 对这个型号的模拟很完整，
+# 而且是 PCI 设备里资料最全的一个，适合从零写驱动。
+ethernet0.present = "TRUE"
+ethernet0.virtualDev = "e1000"
+ethernet0.connectionType = "nat"
+ethernet0.addressType = "generated"
+ethernet0.startConnected = "TRUE"
 
 ide1:0.present = "TRUE"
 ide1:0.deviceType = "cdrom-image"
