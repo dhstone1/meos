@@ -12,9 +12,12 @@
     用法：
         .\build.ps1            构建
         .\build.ps1 -Clean     先清空 build\ 再构建
+        .\build.ps1 -SelfTest  额外编一个开机自检版：把一串预置扫描码
+                                喂进键盘译码器，用来验证命令行链路
 #>
 param(
     [switch]$Clean,
+    [switch]$SelfTest,
     [string]$Message = "Hi，我是meos，很高兴来到这个世界~"
 )
 
@@ -69,7 +72,13 @@ if ($LASTEXITCODE -ne 0) { throw '引导扇区汇编失败' }
 # ---- 3. 内核载荷 -----------------------------------------------------------
 Write-Host '[3/5] 汇编内核载荷 ...' -ForegroundColor Cyan
 $PayloadPath = Join-Path $BuildDir 'payload.bin'
-& $Nasm -f bin -I $KernelDir $KernelAsm -o $PayloadPath -l (Join-Path $BuildDir 'kernel.lst')
+$NasmArgs = @('-f', 'bin', '-I', $KernelDir, $KernelAsm,
+              '-o', $PayloadPath, '-l', (Join-Path $BuildDir 'kernel.lst'))
+if ($SelfTest) {
+    Write-Host '  自检模式：开机时会把预置扫描码喂进键盘译码器' -ForegroundColor Yellow
+    $NasmArgs = @('-dSELFTEST=1') + $NasmArgs
+}
+& $Nasm @NasmArgs
 if ($LASTEXITCODE -ne 0) { throw '内核载荷汇编失败' }
 
 # ---- 4. 软盘镜像 + 引导 ISO -------------------------------------------------

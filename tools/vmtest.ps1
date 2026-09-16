@@ -16,11 +16,16 @@
     用法：
         .\tools\vmtest.ps1                  默认等 10 秒后截图
         .\tools\vmtest.ps1 -Wait 15 -Keep    等 15 秒，并且不关虚拟机
+
+    想验证键盘链路，就用 -KeysFile 指一个文本文件，
+    里面一行一段、用 SendKeys 语法（{ENTER} 表示回车），空行和 # 开头的行会被跳过：
+        .\tools\vmtest.ps1 -KeysFile tools\keys.txt -Keep
 #>
 param(
     [int]$Wait = 10,
     [string]$Title = "MeOS",
     [string]$Out = "",
+    [string]$KeysFile = "",
     [switch]$Keep
 )
 
@@ -33,15 +38,15 @@ $Log      = Join-Path $BuildDir 'vmware.log'
 $Vmrun    = 'D:\Program Files\vmrun.exe'
 if (-not $Out) { $Out = Join-Path $BuildDir 'screen.png' }
 
-Write-Host '[1/4] 关掉旧实例 ...'
+Write-Host '[1/5] 关掉旧实例 ...'
 $null = & $Vmrun -T ws stop $Vmx hard
 Start-Sleep -Seconds 2
 if (Test-Path -LiteralPath $Log) { Remove-Item -LiteralPath $Log -Force }
 
-Write-Host '[2/4] 启动虚拟机（图形界面，不阻塞） ...'
+Write-Host '[2/5] 启动虚拟机（图形界面，不阻塞） ...'
 Start-Process -FilePath $Vmrun -ArgumentList @('-T', 'ws', 'start', $Vmx, 'gui') -WindowStyle Hidden
 
-Write-Host '[3/4] 等虚拟机控制台窗口 ...'
+Write-Host '[3/5] 等虚拟机控制台窗口 ...'
 Add-Type -AssemblyName System.Drawing
 $cs = @(
     'using System;',
@@ -61,6 +66,14 @@ $cs = @(
     '    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);',
     '    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);',
     '    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);',
+    '    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr p);',
+    '    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);',
+    '    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);',
+    '    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);',
+    '    [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);',
+    '    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }',
+    '    public const uint MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;',
+    '    public const uint KEYEVENTF_KEYUP = 0x0002, KEYEVENTF_SCANCODE = 0x0008;',
     '    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);',
     '    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);',
     '    public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);',
@@ -105,6 +118,30 @@ $cs = @(
     '        }, IntPtr.Zero);',
     '        return done;',
     '    }',
+    '    public static List<IntPtr> Kids(IntPtr h) {',
+    '        List<IntPtr> r = new List<IntPtr>();',
+    '        EnumChildWindows(h, delegate(IntPtr c, IntPtr p) { r.Add(c); return true; }, IntPtr.Zero);',
+    '        return r;',
+    '    }',
+    '    public static string ClsOf(IntPtr h) {',
+    '        StringBuilder sb = new StringBuilder(128);',
+    '        GetClassName(h, sb, sb.Capacity);',
+    '        return sb.ToString();',
+    '    }',
+    '    // 找后代窗口里第一个可见的指定类名（EnumChildWindows 本来就是递归的）',
+    '    public static string StatusBarText(IntPtr root) {',
+    '        foreach (IntPtr h in Kids(root)) {',
+    '            if (ClsOf(h) == "VMware.StatusBar") return TitleOf(h);',
+    '        }',
+    '        return "";',
+    '    }',
+    '    public static IntPtr FindDescendantByClass(IntPtr root, string cls) {',
+    '        foreach (IntPtr h in Kids(root)) {',
+    '            if (!IsWindowVisible(h)) continue;',
+    '            if (ClsOf(h) == cls) return h;',
+    '        }',
+    '        return IntPtr.Zero;',
+    '    }',
     '}'
 ) -join [Environment]::NewLine
 if (-not ('MeOSApi' -as [type])) { Add-Type -TypeDefinition $cs }
@@ -120,7 +157,7 @@ Write-Host ("  窗口标题：{0}" -f [MeOSApi]::TitleOf($hwnd))
 
 Start-Sleep -Seconds $Wait
 
-Write-Host '[4/4] 清场、置顶、截图 ...'
+Write-Host '[4/5] 清场、置顶 ...'
 $rect = New-Object MeOSApi+RECT
 $null = [MeOSApi]::GetWindowRect($hwnd, [ref]$rect)
 $hidden = [MeOSApi]::MinimizeOverlapping($hwnd, $rect)
@@ -131,6 +168,99 @@ $null = [MeOSApi]::SetWindowPos($hwnd, [MeOSApi]::HWND_TOPMOST, 0, 0, 0, 0,
         ([MeOSApi]::SWP_NOMOVE -bor [MeOSApi]::SWP_NOSIZE -bor [MeOSApi]::SWP_SHOWWINDOW))
 $null = [MeOSApi]::SetForegroundWindow($hwnd)
 Start-Sleep -Milliseconds 2500
+
+# 键注入用「硬件扫描码」，不用 SendKeys。
+# SendKeys / keybd_event 发的是虚拟键，VMware 一律丢掉，一个字节都进不了客户机；
+# 直接发 PS/2 集 1 的扫描码才行——本系统本来吃的就是扫描码，正好省掉一层布局转换。
+$ScanPlain = @{
+    'q'=0x10;'w'=0x11;'e'=0x12;'r'=0x13;'t'=0x14;'y'=0x15;'u'=0x16;'i'=0x17;'o'=0x18;'p'=0x19
+    'a'=0x1E;'s'=0x1F;'d'=0x20;'f'=0x21;'g'=0x22;'h'=0x23;'j'=0x24;'k'=0x25;'l'=0x26
+    'z'=0x2C;'x'=0x2D;'c'=0x2E;'v'=0x2F;'b'=0x30;'n'=0x31;'m'=0x32
+    '1'=0x02;'2'=0x03;'3'=0x04;'4'=0x05;'5'=0x06;'6'=0x07;'7'=0x08;'8'=0x09;'9'=0x0A;'0'=0x0B
+    '-'=0x0C;'='=0x0D;'['=0x1A;']'=0x1B;'\'=0x2B;';'=0x27;"'"=0x28;'`'=0x29;','=0x33;'.'=0x34;'/'=0x35
+    ' '=0x39
+}
+$ScanShift = @{
+    '!'=0x02;'@'=0x03;'#'=0x04;'$'=0x05;'%'=0x06;'^'=0x07;'&'=0x08;'*'=0x09;'('=0x0A;')'=0x0B
+    '_'=0x0C;'+'=0x0D;'{'=0x1A;'}'=0x1B;'|'=0x2B;':'=0x27;'"'=0x28;'~'=0x29;'<'=0x33;'>'=0x34;'?'=0x35
+}
+$ScanToken = @{ '{ENTER}'=0x1C; '{BS}'=0x0E; '{TAB}'=0x0F; '{SPACE}'=0x39; '{ESC}'=0x01 }
+
+function Send-Scancodes {
+    param([string]$Text)
+    $i = 0
+    while ($i -lt $Text.Length) {
+        $shift = $false
+        $code = $null
+        if ($Text[$i] -eq '{') {
+            $end = $Text.IndexOf('}', $i)
+            if ($end -gt $i) {
+                $tok = $Text.Substring($i, $end - $i + 1).ToUpper()
+                if ($ScanToken.ContainsKey($tok)) { $code = $ScanToken[$tok] }
+                $i = $end + 1
+            } else { $i++ }
+        } else {
+            $ch = $Text[$i]
+            if ($ScanPlain.ContainsKey($ch)) { $code = $ScanPlain[$ch] }
+            elseif ($ScanShift.ContainsKey($ch)) { $shift = $true; $code = $ScanShift[$ch] }
+            elseif ($ch -cmatch '[A-Z]') { $shift = $true; $code = $ScanPlain[$ch.ToString().ToLower()] }
+            $i++
+        }
+        if ($null -eq $code) { continue }
+        if ($shift) { [MeOSApi]::keybd_event(0, 0x2A, [MeOSApi]::KEYEVENTF_SCANCODE, [IntPtr]::Zero) }
+        [MeOSApi]::keybd_event(0, [byte]$code, [MeOSApi]::KEYEVENTF_SCANCODE, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 20
+        [MeOSApi]::keybd_event(0, [byte]$code,
+            ([MeOSApi]::KEYEVENTF_SCANCODE -bor [MeOSApi]::KEYEVENTF_KEYUP), [IntPtr]::Zero)
+        if ($shift) { [MeOSApi]::keybd_event(0, 0x2A,
+            ([MeOSApi]::KEYEVENTF_SCANCODE -bor [MeOSApi]::KEYEVENTF_KEYUP), [IntPtr]::Zero) }
+        Start-Sleep -Milliseconds 40
+    }
+}
+
+if ($KeysFile) {
+    if (-not (Test-Path -LiteralPath $KeysFile)) { throw "找不到按键脚本：$KeysFile" }
+    $keys = @(Get-Content -LiteralPath $KeysFile -Encoding UTF8 |
+              Where-Object { $_.Trim() -ne '' -and -not $_.TrimStart().StartsWith('#') })
+
+    # VMware 不会自动把键盘交给客户机，得先在虚拟机画面里点一下——状态栏那句
+    # 「请在虚拟机内部单击或按 Ctrl+G」就是这个意思。但第一次点击往往只是把窗口
+    # 激活，所以点完要读状态栏确认，没抓到就再点。
+    $guest = [MeOSApi]::FindDescendantByClass($hwnd, 'VMware.GuestWindow')
+    if ($guest -eq [IntPtr]::Zero) { $guest = $hwnd }
+    $gr = New-Object MeOSApi+RECT
+    $null = [MeOSApi]::GetWindowRect($guest, [ref]$gr)
+    $cx = [int](($gr.Left + $gr.Right) / 2)
+    $cy = [int](($gr.Top + $gr.Bottom) / 2)
+    $old = New-Object MeOSApi+POINT
+    $null = [MeOSApi]::GetCursorPos([ref]$old)
+
+    $grabbed = $false
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        $null = [MeOSApi]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 300
+        $null = [MeOSApi]::SetCursorPos($cx, $cy)
+        Start-Sleep -Milliseconds 200
+        [MeOSApi]::mouse_event([MeOSApi]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 80
+        [MeOSApi]::mouse_event([MeOSApi]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 600
+        if ([MeOSApi]::StatusBarText($hwnd) -like '*Ctrl+Alt*') { $grabbed = $true; break }
+    }
+    if ($grabbed) {
+        Write-Host ('  键盘已交给客户机（单击处 {0},{1}）' -f $cx, $cy)
+    } else {
+        Write-Host '  [警告] 没能把键盘交给客户机，扫描码可能送不进去' -ForegroundColor Yellow
+    }
+
+    Write-Host ('[5/5] 往虚拟机里发扫描码（{0} 段） ...' -f $keys.Count)
+    foreach ($k in $keys) {
+        Send-Scancodes $k
+        Start-Sleep -Milliseconds 250
+    }
+    Start-Sleep -Milliseconds 800
+    $null = [MeOSApi]::SetCursorPos($old.X, $old.Y)   # 鼠标原位奉还
+}
 
 $null = [MeOSApi]::GetWindowRect($hwnd, [ref]$rect)
 $width  = $rect.Right - $rect.Left

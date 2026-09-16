@@ -1,11 +1,19 @@
+# 构建产物
 build/
+
+# 汇编 / 镜像中间产物
 *.o
 *.bin
 *.pe
 *.map
+
+# 虚拟机运行时文件
 *.vmem
 *.vmss
 *.vmsd
 *.nvram
 *.lck/
 *.log
+
+# 随手截的图，别提交
+/*.png

@@ -1,0 +1,14 @@
+# vmtest.ps1 -KeysFile 用的按键脚本样例。
+#
+# 一行一段，{ENTER} 表示回车，{BS} 退格，{TAB} 制表，{SPACE} 空格。
+# 脚本会把每个字符翻译成 PS/2 扫描码，再用 keybd_event 发进当前前台窗口。
+#
+# 注意：VMware Workstation 会在底层丢掉宿主侧合成的按键（SendKeys / keybd_event /
+# PostMessage 都试过，一个扫描码都进不了客户机），所以这份脚本在 VMware 里发不进去。
+# 键盘链路的自动化验证请走 .\build.ps1 -SelfTest 那条路，见 README「调试手段」。
+# 这里保留它，是因为换到别的虚拟机 / 别的安全设置下它可能还能用。
+hello world{ENTER}
+help{ENTER}
+echo typing works{ENTER}
+MeOS 1234{ENTER}
+ver{ENTER}

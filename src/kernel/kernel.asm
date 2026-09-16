@@ -13,8 +13,11 @@
 ;    二、32 位保护模式（真正干活）
 ;        5. 建一张兜底的 IDT——保护模式下没有 IDT，任何异常都会三重故障，
 ;           VMware 会把整台虚拟机复位，排查起来极其难受；
-;        6. 采一份硬件参数写进诊断块（0x6200），再清屏、居中画字；
-;        7. 屏蔽 8259 后开中断空转，CPU 真正歇下来，画面保持不动。
+;        6. 采一份硬件参数写进诊断块（0x6200），清屏、在顶部画中文横幅；
+;        7. 重映射 8259，开 IRQ0（定时器，给光标闪烁提供节拍）和 IRQ1（键盘）；
+;        8. 把屏幕当成 16x24 点阵的文本控制台驱动（画字、换行、滚屏、光标）；
+;        9. 进命令行主循环：中断只往环形缓冲里丢字符，
+;           行编辑与命令分发在主循环里做。
 ;
 ;  诊断块：.vmx 运行期间 VMware 会把客户机物理内存镜像到 build\*.vmem，
 ;  于是「把中间结果写进 0x6200」就等于有了一条输出通道，比盯着黑屏猜快得多。
@@ -49,6 +52,12 @@ PARAM_MAGIC equ 0x534F454D         ; "MEOS" 的小端表示
 
 FONT_TEXT_W     equ FONT_CHAR_NUM * FONT_STEP - FONT_GAP   ; 整句话的像素宽度
 
+KBD_RING_SIZE   equ 64             ; 键盘环形缓冲，主循环一轮就能喝干
+KBD_RING_MASK   equ KBD_RING_SIZE - 1
+LINE_MAX        equ 128            ; 一行最多 127 个字符
+BANNER_Y        equ 16             ; 中文横幅贴在顶部，下面整块留给命令行
+CONSOLE_TOP_ROW equ 3              ; 命令行从第 3 个文字行开始（横幅占 16..48 像素）
+
 ; 诊断块内部偏移
 D_STAGE     equ 0x00               ; dword 执行到第几步（1=IDT 2=清屏 3=画字 4=停机）
 D_CX        equ 0x04               ; dword 文字左上角 X
@@ -66,6 +75,18 @@ D_PROBE_ALT equ 0x30               ; dword 在 SVGA_REG_FB_START+0x1000 处读�
 D_BARPIX    equ 0x34               ; dword 保留
 D_TEXTPIX   equ 0x38               ; dword 文字包围盒里读回的白像素数
 D_MSGBOX    equ 0x3C               ; dword 低 16 位 = 文字左上角 X，高 16 位 = Y
+D_KB_IRQ    equ 0x40               ; dword 收到的键盘中断次数
+D_KB_LAST   equ 0x44               ; dword 最近一次原始扫描码
+D_KB_CHARS  equ 0x48               ; dword 翻译成字符的按键次数
+D_TICKS     equ 0x4C               ; dword 定时器节拍数
+D_CON_X     equ 0x50               ; dword 光标所在列
+D_CON_Y     equ 0x54               ; dword 光标所在行
+D_LINE_LEN  equ 0x58               ; dword 当前输入行长度
+D_CMD_NUM   equ 0x5C               ; dword 执行过的命令行数
+D_KB_SHIFT  equ 0x60               ; dword Shift 是否按住
+D_KB_HIST   equ 0x64               ; 8 个 dword：最近 8 个原始扫描码，最新的在最前
+D_CONPIX   equ 0x84               ; dword 整屏白像素数（自检用）
+D_ROWPIX   equ 0x88               ; 25 个 dword：每个文字行各有多少个白像素
 
 ; ============================================================================
 ;  一、16 位实模式
@@ -365,17 +386,26 @@ pm_entry:
     mov esp, KERNEL_STACK_TOP
 
     mov dword [DIAG_ADDR + D_STAGE], 0
-    call setup_idt
+    call setup_idt                      ; 兜底门 + 键盘 / 定时器两个真门
     mov dword [DIAG_ADDR + D_STAGE], 1
     call probe_hardware
     mov dword [DIAG_ADDR + D_STAGE], 2
+    call con_init
     call clear_screen
     mov dword [DIAG_ADDR + D_STAGE], 3
-    call draw_message
+    call draw_message                   ; 顶部的中文横幅
     mov dword [DIAG_ADDR + D_STAGE], 4
     call verify_framebuffer             ; 把显存读回来，确认到底画上没有
     mov dword [DIAG_ADDR + D_STAGE], 5
-    jmp halt_pm
+    mov dword [con_x], 0
+    mov dword [con_y], CONSOLE_TOP_ROW  ; 横幅下面开始接管终端
+    call pic_remap
+    call shell_start
+    call diag_snapshot                  ; 开机时的状态先记一次：没输入时它就不会变了
+    call verify_console                 ; 开机就把自己画的东西数一遍，写进诊断块
+    mov dword [DIAG_ADDR + D_STAGE], 6
+    sti                                 ; 到这里一切都就绪了，可以开中断
+    jmp shell_loop
 
 ; ---- 读 SVGA 寄存器：EAX = 寄存器号 -> EAX = 值 --------------------------------
 ;  VMware 的 SVGA 用 0x1070（索引）/ 0x1071（值）这一对 32 位端口。读它们是安全的，
@@ -455,7 +485,32 @@ setup_idt:
     add edi, 8
     dec ecx
     jnz .fill
+    mov eax, 0x20                       ; IRQ0 定时器走真处理程序
+    mov edx, timer_isr
+    call set_idt_gate
+    mov eax, 0x21                       ; IRQ1 键盘
+    mov edx, kbd_isr
+    call set_idt_gate
     lidt [idt_descriptor]
+    ret
+
+; ---- 往 IDT 里装一个中断门：EAX = 向量号，EDX = 处理程序地址 ----------------
+set_idt_gate:
+    push ebx
+    push ecx
+    push edx
+    mov ecx, eax
+    shl ecx, 3
+    add ecx, IDT_ADDR
+    mov [ecx + 0], dx
+    mov word [ecx + 2], 0x0008
+    mov byte [ecx + 4], 0x00
+    mov byte [ecx + 5], 0x8E            ; P=1, DPL=0, 32 位中断门
+    shr edx, 16
+    mov [ecx + 6], dx
+    pop edx
+    pop ecx
+    pop ebx
     ret
 
 ; 异常处理程序：在屏幕顶上刷一条红杠再停住，一眼就能看出是「CPU 出事了」
@@ -490,7 +545,7 @@ clear_screen:
     rep stosd
     ret
 
-; ---- 把整句话水平、垂直居中画出来 ---------------------------------------------
+; ---- 把整句话水平居中、贴顶画出来 ---------------------------------------------
 draw_message:
     movzx eax, word [PARAM_ADDR + P_WIDTH]
     mov ecx, FONT_TEXT_W
@@ -504,9 +559,7 @@ draw_message:
 .store:
     mov [cursor_x], eax
 
-    movzx eax, word [PARAM_ADDR + P_HEIGHT]
-    sub eax, FONT_GLYPH_H
-    shr eax, 1
+    mov eax, BANNER_Y                           ; 横幅贴顶，下面整块留给命令行
     mov [cursor_y], eax
 
     mov eax, [cursor_x]
@@ -614,6 +667,813 @@ verify_framebuffer:
     popad
     ret
 
+; ============================================================================
+;  三、中断：8259 重映射 + 键盘 / 定时器
+; ============================================================================
+;  保护模式下的外部中断要走 8259。它上电默认把 IRQ0..7 映射到 INT 08h..0Fh，
+;  正好压着 CPU 自己的异常向量，所以必须先重映射到 0x20 以上，再按需要放开某几条线。
+;  这一阶段只用两条：IRQ0 定时器（给光标闪烁提供节拍）、IRQ1 键盘。
+
+pic_remap:
+    pushad
+    mov al, 0x11                        ; ICW1：边沿触发、后面还要跟 ICW4
+    out 0x20, al
+    out 0xA0, al
+    mov al, 0x20                        ; ICW2：主片的 IRQ0 -> INT 0x20
+    out 0x21, al
+    mov al, 0x28                        ; ICW2：从片的 IRQ0 -> INT 0x28
+    out 0xA1, al
+    mov al, 0x04                        ; ICW3：从片挂在主片的 IRQ2 上
+    out 0x21, al
+    mov al, 0x02
+    out 0xA1, al
+    mov al, 0x01                        ; ICW4：8086/88 模式
+    out 0x21, al
+    out 0xA1, al
+    mov al, 0xFC                        ; 只放开 IRQ0、IRQ1，其余全屏蔽
+    out 0x21, al
+    mov al, 0xFF
+    out 0xA1, al
+    popad
+    ret
+
+; ---- 定时器中断（IRQ0 -> INT 0x20）：数节拍，顺带让光标闪 --------------------
+timer_isr:
+    pushad
+    inc dword [DIAG_ADDR + D_TICKS]
+    mov eax, [DIAG_ADDR + D_TICKS]
+    test eax, 7                         ; PIT 默认 18.2Hz，8 个节拍约 0.44 秒
+    jnz .eoi
+    cmp byte [cur_visible], 0
+    je .paint
+    call con_erase_cursor
+    jmp .eoi
+.paint:
+    call con_draw_cursor
+.eoi:
+    mov al, 0x20                        ; 告诉 8259：这条中断处理完了
+    out 0x20, al
+    popad
+    iretd
+
+; ---- 键盘中断（IRQ1 -> INT 0x21）--------------------------------------------
+;  从端口 0x60 读扫描码。8042 默认开着翻译，所以拿到的是「扫描码集 1」：
+;    低 7 位是键号，最高位为 1 表示松键；0xE0 前缀表示扩展键（方向键那类）。
+;  这里只认能产生字符的键，把结果塞进环形缓冲，真正的处理放在主循环里做——
+;  中断里做的事越少越好。
+kbd_isr:
+    pushad
+    mov dx, 0x60
+    in  al, dx
+    movzx ebx, al
+    inc dword [DIAG_ADDR + D_KB_IRQ]
+    mov [DIAG_ADDR + D_KB_LAST], ebx
+
+    ; 扫描码历史：整体后移一格，新的放最前。
+    ; 只看最后一个扫描码是不够的——只有看到整串才知道
+    ; 到底是没收到按键，还是收到了但译码不对。
+    mov ecx, 7
+.hist:
+    mov eax, [DIAG_ADDR + D_KB_HIST + ecx * 4 - 4]
+    mov [DIAG_ADDR + D_KB_HIST + ecx * 4], eax
+    dec ecx
+    jnz .hist
+    mov [DIAG_ADDR + D_KB_HIST], ebx
+
+    mov al, bl
+    call kbd_handle_scancode
+    movzx eax, byte [kb_shift]
+    mov [DIAG_ADDR + D_KB_SHIFT], eax
+    mov al, 0x20                        ; 告诉 8259：这条中断处理完了
+    out 0x20, al
+    popad
+    iretd
+
+; ---- 扫描码译码：AL = 扫描码 ------------------------------------------------
+;  译码单独拆成一个函数，是为了让中断和开机自检走**同一份**代码：
+;  否则自检只能验证另写的一份副本，验了等于没验。
+;  扫描码集 1：低 7 位是键号，最高位为 1 表示松键，0xE0 前缀表示扩展键。
+kbd_handle_scancode:
+    push eax
+    push ebx
+    movzx ebx, al
+
+    cmp bl, 0xE0                        ; 扩展键前缀：记住，下个字节一起丢掉
+    jne .not_ext
+    mov byte [kb_ext], 1
+    jmp .done
+.not_ext:
+    mov al, bl
+    and al, 0x7F                        ; 去掉松键标志，留下键号
+    test bl, 0x80
+    jz .make
+
+    ; ---- 松键：只有 Shift 需要关心 ----
+    cmp al, 0x2A
+    je .shift_up
+    cmp al, 0x36
+    je .shift_up
+    jmp .done
+.shift_up:
+    mov byte [kb_shift], 0
+    jmp .done
+
+    ; ---- 按下 ----
+.make:
+    cmp al, 0x2A
+    je .shift_down
+    cmp al, 0x36
+    je .shift_down
+    cmp al, 0x3A
+    je .caps
+    cmp byte [kb_ext], 0
+    jne .done                           ; 扩展键本阶段不处理
+    movzx eax, al
+    cmp byte [kb_shift], 0
+    je .use_lo
+    mov al, [kbd_map_hi + eax]
+    jmp .have_char
+.use_lo:
+    mov al, [kbd_map_lo + eax]
+.have_char:
+    test al, al
+    jz .done                            ; 这个键不产生字符（Shift、F1……）
+    call kbd_apply_caps
+    inc dword [DIAG_ADDR + D_KB_CHARS]
+    call kbd_ring_push
+    jmp .done
+.shift_down:
+    mov byte [kb_shift], 1
+    jmp .done
+.caps:
+    xor byte [kb_caps], 1               ; 大写锁定：按一下翻一次
+.done:
+    mov byte [kb_ext], 0
+    pop ebx
+    pop eax
+    ret
+
+
+; ---- 大写锁定：只翻字母的大小写，符号不受影响 --------------------------------
+kbd_apply_caps:
+    cmp byte [kb_caps], 0
+    je .done
+    cmp al, 'a'
+    jb .upper
+    cmp al, 'z'
+    ja .done
+    sub al, 0x20
+    ret
+.upper:
+    cmp al, 'A'
+    jb .done
+    cmp al, 'Z'
+    ja .done
+    add al, 0x20
+.done:
+    ret
+
+; ---- 字符入环形缓冲：AL = 字符 ------------------------------------------------
+;  满了一律丢掉，宁可丢键也不能覆盖还没读走的内容。
+kbd_ring_push:
+    push eax
+    push ebx
+    push edx
+    mov edx, [kbd_head]
+    lea ebx, [edx + 1]
+    and ebx, KBD_RING_MASK
+    cmp ebx, [kbd_tail]
+    je .full
+    mov [kbd_ring + edx], al
+    mov [kbd_head], ebx
+.full:
+    pop edx
+    pop ebx
+    pop eax
+    ret
+
+; ---- 从环形缓冲取字符：EAX = 字符，-1 表示没有新字符 --------------------------
+kbd_pop:
+    mov edx, [kbd_tail]
+    cmp edx, [kbd_head]
+    je .empty
+    movzx eax, byte [kbd_ring + edx]
+    inc edx
+    and edx, KBD_RING_MASK
+    mov [kbd_tail], edx
+    ret
+.empty:
+    mov eax, -1
+    ret
+
+; ============================================================================
+;  四、文本控制台
+; ============================================================================
+;  屏幕按 16x24 像素切成格子，800x600 正好 50 列 25 行。
+;  所有画字都是「定位到格子 -> 刷黑底 -> 铺点阵」，没有硬件滚动寄存器可用，
+;  滚屏就是把显存整体往上搬一个文字行。
+
+; ---- 按帧缓冲参数算出控制台尺寸 ----------------------------------------------
+con_init:
+    movzx eax, word [PARAM_ADDR + P_WIDTH]
+    xor edx, edx
+    mov ecx, ASCII_CELL_W
+    div ecx
+    mov [con_cols], eax
+    movzx eax, word [PARAM_ADDR + P_HEIGHT]
+    xor edx, edx
+    mov ecx, ASCII_CELL_H
+    div ecx
+    mov [con_rows], eax
+    ret
+
+; ---- 输入：EBX = 列，ECX = 行；输出：EAX = 该格子左上角在显存里的地址 --------
+;  只动 EAX，EDX / EBX / ECX 一律保持原样，方便调用方连着用。
+con_cell_addr:
+    push edx
+    mov eax, ecx
+    imul eax, ASCII_CELL_H
+    movzx edx, word [PARAM_ADDR + P_PITCH]
+    imul eax, edx
+    push eax
+    mov eax, ebx
+    imul eax, ASCII_CELL_W
+    mov edx, [PARAM_ADDR + P_PIXBYTES]
+    imul eax, edx
+    pop edx
+    add eax, edx
+    add eax, [PARAM_ADDR + P_FB]
+    pop edx
+    ret
+
+; ---- 输入：EDI = 起点，EBP = 行数，EDX = 颜色；刷满一个格子宽 -----------------
+fill_rows_edi:
+    push eax
+    push ecx
+    push esi
+.row:
+    mov esi, edi
+    mov ecx, ASCII_CELL_W
+.col:
+    cmp dword [PARAM_ADDR + P_PIXBYTES], 4
+    jne .px24
+    mov [esi], edx
+    jmp .next
+.px24:
+    mov [esi + 0], dl
+    mov [esi + 1], dh
+    mov eax, edx
+    shr eax, 16
+    mov [esi + 2], al
+.next:
+    add esi, [PARAM_ADDR + P_PIXBYTES]
+    dec ecx
+    jnz .col
+    movzx eax, word [PARAM_ADDR + P_PITCH]
+    add edi, eax
+    dec ebp
+    jnz .row
+    pop esi
+    pop ecx
+    pop eax
+    ret
+
+; ---- 输入：EDI = 单元格地址，EDX = 颜色 --------------------------------------
+fill_cell_edi:
+    mov ebp, ASCII_CELL_H
+    jmp fill_rows_edi
+
+; ---- 输入：EBX = 列，ECX = 行，EDX = 颜色 ------------------------------------
+con_fill_cell:
+    pushad
+    call con_cell_addr
+    mov edi, eax
+    call fill_cell_edi
+    popad
+    ret
+
+; ---- 输入：EDI = 单元格地址，AL = 字符 ---------------------------------------
+;  只铺点阵不擦背景，越界的字符直接当空白（调用方已经刷过黑底）。
+draw_char_edi:
+    pushad
+    movzx eax, al
+    sub eax, ASCII_FIRST
+    jb .done
+    cmp eax, ASCII_COUNT
+    jae .done
+    mov ecx, ASCII_GLYPH_LEN
+    imul eax, ecx
+    lea esi, [ascii_font + eax]
+
+    mov ebp, ASCII_CELL_H
+.row:
+    mov ebx, ASCII_ROW_BYTES
+    mov edx, edi
+.byte:
+    movzx eax, byte [esi]
+    inc esi
+    mov ecx, 8
+.bit:
+    shl al, 1                           ; 同样必须是 8 位移位，理由见 draw_glyph
+    jnc .next
+    cmp dword [PARAM_ADDR + P_PIXBYTES], 4
+    jne .px24
+    mov dword [edx], 0x00FFFFFF
+    jmp .next
+.px24:
+    mov byte [edx + 0], 0xFF
+    mov byte [edx + 1], 0xFF
+    mov byte [edx + 2], 0xFF
+.next:
+    add edx, [PARAM_ADDR + P_PIXBYTES]
+    dec ecx
+    jnz .bit
+    dec ebx
+    jnz .byte
+    movzx eax, word [PARAM_ADDR + P_PITCH]
+    add edi, eax
+    dec ebp
+    jnz .row
+.done:
+    popad
+    ret
+
+; ---- 输入：AL = 字符，EBX = 列，ECX = 行 -------------------------------------
+con_putc_at:
+    pushad
+    mov [con_ch], al
+    call con_cell_addr
+    push eax                            ; 先存一份，等下铺点阵还要用
+    mov edi, eax
+    xor edx, edx
+    call fill_cell_edi                  ; 刷黑底
+    pop edi
+    mov al, [con_ch]
+    call draw_char_edi                  ; 再铺点阵
+    popad
+    ret
+
+; ---- 光标：格子底部两行刷一条白杠 --------------------------------------------
+con_draw_cursor:
+    mov byte [cur_visible], 1
+    mov edx, 0x00FFFFFF
+    call cursor_bar
+    ret
+
+con_erase_cursor:
+    mov byte [cur_visible], 0
+    xor edx, edx
+    call cursor_bar
+    ret
+
+cursor_bar:
+    push eax
+    push ebx
+    push ecx
+    push edi
+    mov ebx, [con_x]
+    mov ecx, [con_y]
+    call con_cell_addr
+    mov edi, eax
+    movzx eax, word [PARAM_ADDR + P_PITCH]
+    imul eax, ASCII_CELL_H - 2
+    add edi, eax                        ; 挪到格子底部两行
+    mov ebp, 2
+    call fill_rows_edi
+    pop edi
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; ---- 滚屏：显存整体上移一个文字行，再把最后一行刷黑 --------------------------
+con_scroll:
+    pushad
+    movzx eax, word [PARAM_ADDR + P_PITCH]
+    imul eax, ASCII_CELL_H              ; EAX = 一个文字行占多少字节
+    mov edx, eax
+    mov ebx, [con_rows]
+    dec ebx
+    imul ebx, eax                       ; EBX = 要搬的总字节数
+
+    mov esi, [PARAM_ADDR + P_FB]
+    add esi, edx                        ; 源：第 1 个文字行
+    mov edi, [PARAM_ADDR + P_FB]        ; 目标：第 0 个文字行
+    mov ecx, ebx
+    shr ecx, 2                          ; 行跨度是 4 的倍数，按双字搬就够
+    cld
+    rep movsd
+
+    mov edi, [PARAM_ADDR + P_FB]
+    mov eax, edx
+    mov ebx, [con_rows]
+    dec ebx
+    imul eax, ebx
+    add edi, eax                        ; 最后一行
+    mov ecx, edx
+    shr ecx, 2
+    xor eax, eax
+    rep stosd
+    popad
+    ret
+
+; ---- 换行：列归零、行加一，到底了就先滚屏 ------------------------------------
+con_newline:
+    pushad
+    mov dword [con_x], 0
+    inc dword [con_y]
+    mov eax, [con_rows]
+    cmp [con_y], eax
+    jb .done
+    call con_scroll
+    dec dword [con_y]
+.done:
+    popad
+    ret
+
+; ---- 清空整个控制台区域 ------------------------------------------------------
+con_clear_all:
+    pushad
+    call con_erase_cursor
+    mov edi, [PARAM_ADDR + P_FB]
+    movzx eax, word [PARAM_ADDR + P_PITCH]
+    mov ecx, [con_rows]
+    imul ecx, ASCII_CELL_H
+    imul ecx, eax
+    shr ecx, 2
+    cmp ecx, 16 * 1024 * 1024 / 4       ; 兜底：参数再离谱也不刷超过 16MB
+    jbe .ok
+    mov ecx, 16 * 1024 * 1024 / 4
+.ok:
+    xor eax, eax
+    cld
+    rep stosd
+    mov dword [con_x], 0
+    mov dword [con_y], 0
+    mov byte [cur_visible], 0
+    popad
+    ret
+
+; ---- 输出一个字符：AL = 字符 -------------------------------------------------
+;  认得回车、换行、退格和可打印字符，其余忽略。
+con_putc:
+    pushad
+    mov [con_ch], al
+    cmp al, 13
+    je .newline
+    cmp al, 10
+    je .newline
+    cmp al, 8
+    je .backspace
+    cmp al, ASCII_FIRST
+    jb .done
+    cmp al, ASCII_LAST
+    ja .done
+
+    call con_erase_cursor
+    mov ebx, [con_x]
+    mov ecx, [con_y]
+    mov al, [con_ch]
+    call con_putc_at
+    inc dword [con_x]
+    mov eax, [con_cols]
+    cmp [con_x], eax
+    jb .draw_cursor
+    call con_newline                    ; 写满一行自动折行
+    jmp .draw_cursor
+
+.backspace:
+    cmp dword [con_x], 0
+    je .done                            ; 这一行的开头，退无可退
+    call con_erase_cursor
+    dec dword [con_x]
+    mov ebx, [con_x]
+    mov ecx, [con_y]
+    xor edx, edx
+    call con_fill_cell                  ; 把那个字符擦掉
+    jmp .draw_cursor
+
+.newline:
+    call con_erase_cursor
+    call con_newline
+.draw_cursor:
+    call con_draw_cursor
+.done:
+    popad
+    ret
+
+; ---- 换行（会管光标） ------------------------------------------------------
+;  con_newline 只管把位置挪到下一行，它不碰光标——光标是 con_putc 的事。
+;  上层想换行必须用这个，否则光标横杠会留在原地没人擦。
+con_crlf:
+    mov al, 13
+    call con_putc
+    ret
+
+; ---- 输出一个以 0 结尾的字符串：ESI = 字符串 ---------------------------------
+con_puts:
+    pushad
+.next:
+    mov al, [esi]
+    test al, al
+    jz .done
+    inc esi
+    call con_putc
+    jmp .next
+.done:
+    popad
+    ret
+
+; ============================================================================
+;  五、命令行
+; ============================================================================
+;  中断只负责把字符丢进环形缓冲，行编辑和命令分发都在主循环里做。
+;  这样即使某条命令跑得慢，键盘也不会丢键。
+
+; ---- 打提示符，准备接收下一行 -------------------------------------------------
+shell_start:
+    mov dword [line_len], 0
+    mov byte [line_buf], 0
+    mov esi, msg_prompt
+    call con_puts
+    ret
+
+; ---- 往输入行追加一个字符：AL = 字符 -----------------------------------------
+line_append:
+    mov ecx, [line_len]
+    cmp ecx, LINE_MAX - 1
+    jae .full
+    mov [line_buf + ecx], al
+    inc dword [line_len]
+    mov byte [line_buf + ecx + 1], 0    ; 一直保持 0 结尾，取出来就能直接当字符串用
+.full:
+    ret
+
+; ---- 退格：删掉行尾一个字符，屏幕上也擦掉 -------------------------------------
+line_backspace:
+    cmp dword [line_len], 0
+    je .done
+    dec dword [line_len]
+    mov ecx, [line_len]
+    mov byte [line_buf + ecx], 0
+    mov al, 8
+    call con_putc
+.done:
+    ret
+
+; ---- 主循环 ------------------------------------------------------------------
+; ---- 开机自检喂码：返回 EAX = 1 表示刚喂进一个扫描码 --------------------------
+;  正常构建里它就是个空函数。带 -dSELFTEST=1 编译时，它会把一串预置扫描码
+;  逐个喂进 kbd_handle_scancode——和真键盘中断走的是同一条路，区别只在谁调用它。
+;  这么做是因为：宕机侧没办法给 VMware 注入按键（合成输入会被丢掉），
+;  而译码、行编辑、终端渲染这一整条链路仍然值得被确定性地验证。
+selftest_tick:
+    xor eax, eax
+%ifdef SELFTEST
+    mov ecx, [selftest_ptr]
+    cmp ecx, selftest_len
+    jae .done
+    movzx edx, byte [selftest_data + ecx]
+    inc dword [selftest_ptr]
+    test dl, dl
+    jz .done                            ; 0 当空档，这一拍什么都不喂
+    mov al, dl
+    call kbd_handle_scancode
+    mov eax, 1
+.done:
+%endif
+    ret
+
+; ---- 整屏自检：数一数整个屏幕上有多少个白像素 ------------------------------
+;  和横幅那个自检是同一个套路，只是范围从横幅扩到整屏。
+;  宿主机那边只要把「该出现的字符」模拟一遍算出期望值，
+;  两边一对，就能证明——不是“屏幕上好像有字”，而是“该画的一个像素不差”。
+verify_console:
+    pushad
+    cmp dword [PARAM_ADDR + P_PIXBYTES], 4
+    jne .done                           ; 只会数 32 位色，别的位深不装
+    pushfd                              ; 光标会闪，数的时候先把中断关了；
+    cli                                 ; 用 pushfd/popfd 而不是 cli/sti，
+                                        ; 免得把本来还没开的中断给提前打开了
+    call con_erase_cursor
+    xor ebx, ebx                        ; 整屏总数
+    xor ebp, ebp                        ; 第几个文字行
+.row:
+    mov edi, [PARAM_ADDR + P_FB]
+    movzx eax, word [PARAM_ADDR + P_PITCH]
+    mov ecx, ebp
+    imul ecx, ASCII_CELL_H
+    imul ecx, eax
+    add edi, ecx                        ; 这一行的起点
+    movzx edx, word [PARAM_ADDR + P_PITCH]
+    shr edx, 2
+    imul edx, ASCII_CELL_H              ; 这一行有多少个像素
+    xor esi, esi
+.col:
+    cmp dword [edi], 0x00FFFFFF
+    jne .next
+    inc esi
+.next:
+    add edi, 4
+    dec edx
+    jnz .col
+    mov [DIAG_ADDR + D_ROWPIX + ebp * 4], esi
+    add ebx, esi
+    inc ebp
+    cmp ebp, [con_rows]
+    jb .row
+    mov [DIAG_ADDR + D_CONPIX], ebx
+    call con_draw_cursor
+    popfd
+.done:
+    popad
+    ret
+
+; ---- 把控制台状态抄进诊断块，方便宕机上的 vmdiag.py 直接读 ------
+;  放在空转之前做：这时候主循环没有半截状态，抄出来的数最准。
+diag_snapshot:
+%ifdef SELFTEST
+    ; 自检流喂完、而且这一轮已经没有新字符要处理了，
+    ; 就做一次整屏自检。放在这里是因为它只会在空转时跑。
+    cmp byte [selftest_verified], 0
+    jne .skip
+    mov eax, [selftest_ptr]
+    cmp eax, selftest_len
+    jb .skip
+    mov byte [selftest_verified], 1
+    call verify_console
+.skip:
+%endif
+    mov eax, [con_x]
+    mov [DIAG_ADDR + D_CON_X], eax
+    mov eax, [con_y]
+    mov [DIAG_ADDR + D_CON_Y], eax
+    mov eax, [line_len]
+    mov [DIAG_ADDR + D_LINE_LEN], eax
+    ret
+
+shell_loop:
+    call selftest_tick                  ; 自检模式下在这里逐个喂扫描码
+    test eax, eax
+    jnz .have_input
+    hlt                                 ; 中断开着，按一个键就会醒
+.have_input:
+    call kbd_pop
+    cmp eax, -1
+    je shell_loop
+    cmp al, 13
+    je .enter
+    cmp al, 8
+    je .back
+    cmp al, 9
+    je .tab
+    cmp al, ASCII_FIRST
+    jb .idle
+    cmp al, ASCII_LAST
+    ja .idle
+    call line_append
+    call con_putc
+    jmp .idle
+.enter:
+    call con_crlf
+    call shell_exec
+    call shell_start
+    jmp .idle
+.back:
+    call line_backspace
+    jmp .idle
+.tab:
+    mov al, ' '
+    call line_append
+    call con_putc
+.idle:
+    call diag_snapshot
+    jmp shell_loop
+
+; ---- 执行当前输入行 ----------------------------------------------------------
+shell_exec:
+    pushad
+    inc dword [DIAG_ADDR + D_CMD_NUM]
+    cmp dword [line_len], 0
+    je .done
+
+    mov esi, line_buf
+    mov edi, cmd_help
+    call str_eq
+    test eax, eax
+    jnz .help
+
+    mov esi, line_buf
+    mov edi, cmd_ver
+    call str_eq
+    test eax, eax
+    jnz .ver
+
+    mov esi, line_buf
+    mov edi, cmd_cls
+    call str_eq
+    test eax, eax
+    jnz .cls
+
+    mov esi, line_buf
+    mov edi, cmd_echo
+    mov ecx, 4
+    call str_n_eq
+    test eax, eax
+    jz .unknown
+    movzx eax, byte [line_buf + 4]      ; "echo" 后面要么就此结束，要么跟个空格
+    test al, al
+    jz .echo_blank
+    cmp al, ' '
+    jne .unknown
+    mov esi, line_buf + 5
+    call con_puts
+    call con_crlf
+    jmp .done
+.echo_blank:
+    call con_crlf
+    jmp .done
+
+.help:
+    mov esi, msg_help
+    call con_puts
+    call con_crlf
+    jmp .done
+.ver:
+    mov esi, msg_ver
+    call con_puts
+    call con_crlf
+    jmp .done
+.cls:
+    call con_clear_all
+    jmp .done
+.unknown:
+    mov esi, msg_unknown
+    call con_puts
+    mov esi, line_buf
+    call con_puts
+    call con_crlf
+.done:
+    popad
+    ret
+
+; ---- 字符串比较：ESI、EDI 都以 0 结尾；EAX = 1 表示相同 ----------------------
+str_eq:
+    push ebx
+    push esi
+    push edi
+.loop:
+    mov al, [esi]
+    mov bl, [edi]
+    cmp al, bl
+    jne .no
+    test al, al
+    jz .yes
+    inc esi
+    inc edi
+    jmp .loop
+.no:
+    xor eax, eax
+    pop edi
+    pop esi
+    pop ebx
+    ret
+.yes:
+    mov eax, 1
+    pop edi
+    pop esi
+    pop ebx
+    ret
+
+; ---- 只比前 ECX 个字符：ESI、EDI；EAX = 1 表示相同 ---------------------------
+str_n_eq:
+    push ebx
+    push esi
+    push edi
+.loop:
+    test ecx, ecx
+    jz .yes
+    mov al, [esi]
+    mov bl, [edi]
+    cmp al, bl
+    jne .no
+    inc esi
+    inc edi
+    dec ecx
+    jmp .loop
+.no:
+    xor eax, eax
+    pop edi
+    pop esi
+    pop ebx
+    ret
+.yes:
+    mov eax, 1
+    pop edi
+    pop esi
+    pop ebx
+    ret
+
 ; ---- 停机 ---------------------------------------------------------------------
 halt_pm:
     mov al, 0xFF
@@ -654,6 +1514,66 @@ cursor_y   dd 0
 msg_x0     dd 0
 msg_y0     dd 0
 
+; ---- 键盘扫描码表（集 1）：下标就是去掉最高位的扫描码 -------------------------
+;  两张表的区别只有 Shift 按住时的符号和大小写；0 表示这个键不产生字符。
+kbd_map_lo:
+    db 0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 8, 9
+    db 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', 13, 0, 'a', 's'
+    db 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', 0x27, '`', 0, 0x5C, 'z', 'x', 'c', 'v'
+    db 'b', 'n', 'm', ',', '.', '/', 0, 0, 0, ' ', 0, 0, 0, 0, 0, 0
+    times 64 db 0
+
+kbd_map_hi:
+    db 0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 8, 9
+    db 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', 13, 0, 'A', 'S'
+    db 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', 0x22, '~', 0, 0x7C, 'Z', 'X', 'C', 'V'
+    db 'B', 'N', 'M', '<', '>', '?', 0, 0, 0, ' ', 0, 0, 0, 0, 0, 0
+    times 64 db 0
+
+kbd_ring    times KBD_RING_SIZE db 0
+kbd_head    dd 0
+kbd_tail    dd 0
+kb_shift    db 0
+kb_caps     db 0
+kb_ext      db 0
+kb_raw      db 0
+
+con_x       dd 0
+con_y       dd 0
+con_cols    dd 0
+con_rows    dd 0
+con_ch      db 0
+cur_visible db 0
+
+line_buf    times LINE_MAX db 0
+line_len    dd 0
+
+
+%ifdef SELFTEST
+; 预置的扫描码流，对应的正是这四行：
+;   help
+;   echo typing works
+;   MeOS 1234
+;   ver
+selftest_ptr  dd 0
+selftest_verified db 0
+selftest_len  equ 43
+selftest_data:
+    db 0x23, 0x12, 0x26, 0x19, 0x1C, 0x12, 0x2E, 0x23, 0x18, 0x39, 0x14, 0x15
+    db 0x19, 0x17, 0x31, 0x22, 0x39, 0x11, 0x18, 0x13, 0x25, 0x1F, 0x1C, 0x2A
+    db 0x32, 0xAA, 0x12, 0x2A, 0x18, 0xAA, 0x2A, 0x1F, 0xAA, 0x39, 0x02, 0x03
+    db 0x04, 0x05, 0x1C, 0x2F, 0x12, 0x13, 0x1C
+%endif
+
+msg_prompt  db "meos> ", 0
+msg_help    db "commands: help  ver  echo <text>  cls", 0
+msg_ver     db "MeOS 0.2 (M2) - 32-bit protected mode, PS/2 keyboard", 0
+msg_unknown db "unknown command: ", 0
+cmd_help    db "help", 0
+cmd_ver     db "ver", 0
+cmd_cls     db "cls", 0
+cmd_echo    db "echo", 0
+
 hex_digits  db "0123456789ABCDEF", 0
 msg_vbe_fail db "VBE not available", 13, 10, 0
 msg_set_fail db "VBE set mode failed", 13, 10, 0
@@ -666,3 +1586,4 @@ msg_lbl_pix  db 13, 10, "  PIXB  = 0x", 0
 msg_crlf     db 13, 10, 0
 
 %include "font.inc"
+%include "ascii.inc"
