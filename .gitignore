@@ -17,3 +17,7 @@ build/
 
 # 随手截的图，别提交
 /*.png
+
+# 内部技术文档：只放本地，不进仓库
+docs/技术文档.md
+tools/checkdoc.py

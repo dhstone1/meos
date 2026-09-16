@@ -59,7 +59,7 @@ BANNER_Y        equ 16             ; 中文横幅贴在顶部，下面整块留�
 CONSOLE_TOP_ROW equ 3              ; 命令行从第 3 个文字行开始（横幅占 16..48 像素）
 
 ; 诊断块内部偏移
-D_STAGE     equ 0x00               ; dword 执行到第几步（1=IDT 2=清屏 3=画字 4=停机）
+D_STAGE     equ 0x00               ; dword 执行到第几步（0..6，对照 tools/vmdiag.py 的 STAGES 表）
 D_CX        equ 0x04               ; dword 文字左上角 X
 D_CY        equ 0x08               ; dword 文字左上角 Y
 D_SVGA_ID   equ 0x0C               ; dword SVGA_REG_ID
@@ -86,7 +86,7 @@ D_CMD_NUM   equ 0x5C               ; dword 执行过的命令行数
 D_KB_SHIFT  equ 0x60               ; dword Shift 是否按住
 D_KB_HIST   equ 0x64               ; 8 个 dword：最近 8 个原始扫描码，最新的在最前
 D_CONPIX   equ 0x84               ; dword 整屏白像素数（自检用）
-D_ROWPIX   equ 0x88               ; 25 个 dword：每个文字行各有多少个白像素
+D_ROWPIX    equ 0x88               ; 25 个 dword：每个文字行各有多少个白像素
 
 ; ============================================================================
 ;  一、16 位实模式
@@ -1289,7 +1289,7 @@ verify_console:
     popad
     ret
 
-; ---- 把控制台状态抄进诊断块，方便宕机上的 vmdiag.py 直接读 ------
+; ---- 把控制台状态抄进诊断块，方便宿主机上的 vmdiag.py 直接读 ------
 ;  放在空转之前做：这时候主循环没有半截状态，抄出来的数最准。
 diag_snapshot:
 %ifdef SELFTEST
