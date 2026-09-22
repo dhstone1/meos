@@ -200,6 +200,19 @@ net_start:
     mov dword [gw_mac_valid], 1
     mov dword [DIAG_ADDR + D_NET_STAGE], 6
 
+    ; LLM 代理跑在宿主机上，顺手把 192.168.220.1 的 MAC 也解析了缓存起来：
+    ; llm 每次发包就不必重新 ARP，偶尔丢一个 ARP 应答也不会再连累 TCP。
+    mov eax, NET_HOST
+    call arp_resolve
+    test eax, eax
+    jz .done_nohost
+    mov eax, [out_mac]
+    mov [host_mac], eax
+    movzx eax, word [out_mac + 4]
+    mov [host_mac + 4], ax
+    mov dword [host_mac_valid], 1
+.done_nohost:
+
     ; 顺手 ping 一下网关：这是"IP + ICMP 通了没有"的第一个硬证据
     mov eax, NET_IP
     mov [DIAG_ADDR + D_NET_LOCALIP], eax
@@ -461,6 +474,7 @@ net_init:
 ;  后面都标了它在内存里的实际字节。
 NET_IP      equ 0x32DCA8C0          ; 192.168.220.50   (C0 A8 DC 32)
 NET_GW      equ 0x02DCA8C0          ; 192.168.220.2    (C0 A8 DC 02)
+NET_HOST    equ 0x01DCA8C0          ; 192.168.220.1    (C0 A8 DC 01)
 NET_DNS     equ 0x02DCA8C0          ; 192.168.220.2
 NET_MASK    equ 0x00FFFFFF          ; 255.255.255.0    (FF FF FF 00)
 
@@ -717,9 +731,11 @@ arp_check_reply:
 ; ---- 算下一跳：目标在同一网段就是它自己，否则是网关 --------------------------
 ;  EAX = 目标 IP，返回 EAX = 下一跳 IP
 net_next_hop:
+    ; 同网段判定：异或后按 NET_MASK（内存序 FF FF FF 00）取网络位，
+    ; 全 0 就是同一网段，下一跳 = 目标自己；否则走网关。
     mov edx, eax
     xor edx, NET_IP
-    test edx, ~NET_MASK
+    and edx, NET_MASK
     jz .same
     mov eax, NET_GW
 .same:
@@ -802,12 +818,23 @@ ip_checksum:
 ;  网关的 MAC 开机时已经解析过，缓存起来不再重复问。
 net_arp_for:
     cmp eax, NET_GW
-    jne .ask
+    jne .not_gw
     cmp dword [gw_mac_valid], 0
     je .ask
     mov edx, [gw_mac]
     mov [out_mac], edx
     mov dx, [gw_mac + 4]
+    mov [out_mac + 4], dx
+    mov eax, 1
+    ret
+.not_gw:
+    cmp eax, NET_HOST
+    jne .ask
+    cmp dword [host_mac_valid], 0
+    je .ask
+    mov edx, [host_mac]
+    mov [out_mac], edx
+    mov dx, [host_mac + 4]
     mov [out_mac + 4], dx
     mov eax, 1
     ret
@@ -1487,6 +1514,13 @@ cmd_do_net:
     mov al, '/'
     call con_putc
     mov eax, [DIAG_ADDR + D_NET_RX]
+    call putdec
+    call con_crlf
+
+    ; TCP 状态（llm.inc 维护：0=空闲 1=握手中 2=已连接 3=收尾）
+    mov esi, msg_net_tcp
+    call con_puts
+    mov eax, [tcp_state]
     call putdec
     call con_crlf
     popad

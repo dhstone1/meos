@@ -19,6 +19,7 @@ import sys
 
 SECTOR_SIZE = 512
 FLOPPY_SIZE = 1474560                      # 1.44MB = 2880 个扇区
+LOADER_SECTORS = 64                        # 引导扇区读进内存的扇区数，必须与 src/boot/boot.asm 的 PAYLOAD_SECTORS 一致
 
 
 def main():
@@ -43,6 +44,15 @@ def main():
             payload = fp.read()
         if len(payload) % SECTOR_SIZE:
             payload += b"\x00" * (SECTOR_SIZE - len(payload) % SECTOR_SIZE)
+
+    # 引导扇区只读 LOADER_SECTORS 个扇区，超出去的部分会被静默丢掉。
+    # 那正是「界面上的字画歪了」这类怪现象的来源，所以在这里直接拦住。
+    payload_sectors = (len(payload) + SECTOR_SIZE - 1) // SECTOR_SIZE
+    if payload_sectors > LOADER_SECTORS:
+        raise SystemExit(
+            "载荷过大：%d 字节 = %d 个扇区，而引导扇区只装 %d 个扇区（%d 字节）。"
+            "请先调大 src/boot/boot.asm 的 PAYLOAD_SECTORS，再把这里的 LOADER_SECTORS 改成同一个数。"
+            % (len(payload), payload_sectors, LOADER_SECTORS, LOADER_SECTORS * SECTOR_SIZE))
 
     used = SECTOR_SIZE + len(payload)
     if used > FLOPPY_SIZE:

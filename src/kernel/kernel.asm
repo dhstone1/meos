@@ -112,6 +112,7 @@ D_NET_ERR     equ 0x154            ; dword 最近一次错误码
 D_NET_SCAN    equ 0x158            ; 8 个 dword：总线 0 上扫到的前 8 个设备（vendor | device<<16）
 D_NET_PKTLEN  equ 0x180            ; dword 最近收到那一帧的长度
 D_NET_PKT     equ 0x184            ; 16 个 dword：最近收到那一帧的前 64 字节
+D_NET_TCP     equ 0x1C4            ; dword TCP 状态机：1 握手中 2 已连接 0xFF 失败（见 llm.inc）
 
 ; ============================================================================
 ;  一、16 位实模式
@@ -1233,9 +1234,16 @@ con_puts:
 ;  这样即使某条命令跑得慢，键盘也不会丢键。
 
 ; ---- 打提示符，准备接收下一行 -------------------------------------------------
+;  开机后第一次进 shell 会先要 DeepSeek key（llm_key_done == 0 时）。
 shell_start:
     mov dword [line_len], 0
     mov byte [line_buf], 0
+    cmp dword [llm_key_done], 0
+    jne .normal
+    mov esi, llm_key_prompt
+    call con_puts
+    ret
+.normal:
     mov esi, msg_prompt
     call con_puts
     ret
@@ -1374,10 +1382,20 @@ shell_loop:
     cmp al, ASCII_LAST
     ja .idle
     call line_append
+    cmp dword [llm_key_done], 0
+    jne .echo
+    mov al, '*'                     ; 输 key 时不回显原文
+.echo:
     call con_putc
     jmp .idle
 .enter:
     call con_crlf
+    cmp dword [llm_key_done], 0
+    jne .exec
+    call llm_try_save_key
+    call shell_start
+    jmp .idle
+.exec:
     call shell_exec
     call shell_start
     jmp .idle
@@ -1443,8 +1461,30 @@ shell_exec:
     mov edi, cmd_net
     call str_eq
     test eax, eax
-    jz .try_echo
+    jz .try_llm
     call cmd_do_net
+    jmp .done
+.try_llm:
+    mov esi, line_buf
+    mov edi, cmd_llm
+    call str_eq
+    test eax, eax
+    jz .try_llm_prefix
+    mov esi, msg_llm_usage
+    call con_puts
+    call con_crlf
+    jmp .done
+.try_llm_prefix:
+    mov esi, line_buf
+    mov edi, cmd_llm
+    mov ecx, 3
+    call str_n_eq
+    test eax, eax
+    jz .try_echo
+    cmp byte [line_buf + 3], ' '
+    jne .try_echo
+    mov esi, line_buf + 4
+    call cmd_do_llm
     jmp .done
 .try_echo:
     mov esi, line_buf
@@ -1633,6 +1673,8 @@ arp_ok      dd 0                    ; 解析成功没有
 out_mac     times 8 db 0            ; 解析出来的 MAC（后 2 字节填充）
 gw_mac      times 8 db 0            ; 网关 MAC 缓存
 gw_mac_valid dd 0                   ; 网关 MAC 有效没有
+host_mac    times 8 db 0            ; 宿主机（LLM 代理）MAC 缓存
+host_mac_valid dd 0                 ; 宿主机 MAC 有效没有
 ping_ip     dd 0                    ; 正在 ping 的目标 IP
 ping_seq    dd 0                    ; ICMP 序号
 ping_t0     dd 0                    ; 发出时刻（毫秒）
@@ -1644,6 +1686,14 @@ dns_name_buf times 128 db 0         ; DNS 名字（长度前缀格式）
 dns_query_len dd 0                  ; DNS 查询总长
 ping_host   dd 0                    ; 命令行传进来的目标字符串
 ping_ok     dd 0                    ; 这一轮收到几个应答
+; TCP 连接状态
+tcp_state   dd 0                    ; 0=CLOSED 1=SYN_SENT 2=ESTABLISHED 3=FIN_WAIT
+tcp_seq     dd 0                    ; 本机序号
+tcp_ack     dd 0                    ; 期望收到的对方序号
+tcp_src_port dd 0                   ; 源端口（小端）
+tcp_dst_port dd 0                   ; 目的端口（小端）
+tcp_dst_ip  dd 0                    ; 目的 IP（小端）
+llm_buf     times 4096 db 0         ; LLM 应答缓冲
 ping_n      dd 0                    ; 这一轮发了几个
 
 line_buf    times LINE_MAX db 0
@@ -1651,28 +1701,21 @@ line_len    dd 0
 
 
 %ifdef SELFTEST
-; 预置的扫描码流，对应的正是这六行：
-;   help
-;   echo typing works
-;   MeOS 1234
-;   ver
-;   ping baidu.com
-;   net
+; 预置的扫描码流，对应的正是这行（临时验证用）：
+;   llm hello
 selftest_ptr  dd 0
 selftest_verified db 0
-selftest_len  equ 62
+selftest_len  equ 21
 selftest_data:
-    db 0x23, 0x12, 0x26, 0x19, 0x1C, 0x12, 0x2E, 0x23, 0x18, 0x39, 0x14, 0x15
-    db 0x19, 0x17, 0x31, 0x22, 0x39, 0x11, 0x18, 0x13, 0x25, 0x1F, 0x1C, 0x2A
-    db 0x32, 0xAA, 0x12, 0x2A, 0x18, 0xAA, 0x2A, 0x1F, 0xAA, 0x39, 0x02, 0x03
-    db 0x04, 0x05, 0x1C, 0x2F, 0x12, 0x13, 0x1C, 0x19, 0x17, 0x31, 0x22, 0x39
-    db 0x30, 0x1E, 0x17, 0x20, 0x16, 0x34, 0x2E, 0x18, 0x32, 0x1C, 0x31, 0x12
-    db 0x14, 0x1C
+    db 0x26, 0x26, 0x32, 0x39        ; l l m space
+    db 0x23, 0x12, 0x26, 0x26        ; h e l l
+    db 0x18, 0x1C                    ; o Enter
+    times 11 db 0                    ; 空档，喂完收尾用
 %endif
 
 msg_prompt  db "meos> ", 0
-msg_help    db "commands: help  ver  echo <text>  cls  net  ping <host>", 0
-msg_ver     db "MeOS 0.2 (M2) - 32-bit protected mode, PS/2 keyboard", 0
+msg_help    db "commands: help  ver  echo <text>  cls  net  ping <host>  llm <msg>", 0
+msg_ver     db "MeOS 0.3 (M3) - 32-bit protected mode, PS/2 keyboard + TCP/IP", 0
 msg_unknown db "unknown command: ", 0
 cmd_help    db "help", 0
 cmd_ver     db "ver", 0
@@ -1681,6 +1724,8 @@ cmd_echo    db "echo", 0
 cmd_ping    db "ping", 0
 cmd_net     db "net", 0
 msg_ping_usage db "usage: ping <host|ip>", 0
+cmd_llm     db "llm", 0
+msg_llm_usage db "usage: llm <question>", 0
 
 msg_resolving db "resolving ", 0
 msg_dots      db " ... ", 0
@@ -1701,6 +1746,7 @@ msg_net_link  db "link    ", 0
 msg_up        db "up", 0
 msg_down      db "down", 0
 msg_net_cnt   db "  tx/rx ", 0
+msg_net_tcp   db "tcp     ", 0
 
 hex_digits  db "0123456789ABCDEF", 0
 msg_vbe_fail db "VBE not available", 13, 10, 0
@@ -1714,5 +1760,6 @@ msg_lbl_pix  db 13, 10, "  PIXB  = 0x", 0
 msg_crlf     db 13, 10, 0
 
 %include "net.inc"
+%include "llm.inc"
 %include "font.inc"
 %include "ascii.inc"
