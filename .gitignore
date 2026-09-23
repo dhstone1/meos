@@ -21,3 +21,7 @@ build/
 # 内部技术文档：只放本地，不进仓库
 docs/技术文档.md
 tools/checkdoc.py
+# 密钥与本地测试文件，别提交
+.env
+tools/keys-test.txt
+tools/__pycache__/

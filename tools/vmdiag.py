@@ -26,6 +26,8 @@ NET_STAGES = {0: "还没开始找网卡", 1: "PCI 扫描完了",
               4: "收发环建好了", 5: "链路已 up",
               6: "ARP 解析到网关", 7: "ICMP 收到应答",
               8: "DNS 解析完成", 9: "网络全部就绪"}
+
+TCP_STATES = {0: "空闲", 1: "三次握手中", 2: "已连接", 0xFF: "失败"}
 def find_vmem():
     if len(sys.argv) > 1:
         return sys.argv[1]
@@ -194,6 +196,9 @@ def main():
         print("  DNS 解析    = %s" % ip4(dns_ip))
     if lastip:
         print("  最近 ping   = %s  往返 %d ms" % (ip4(lastip), rtt))
+    tcp = u32(0x1C4)
+    if tcp:
+        print("  TCP 状态    = %s" % TCP_STATES.get(tcp, "未知(%d)" % tcp))
     if neterr:
         print("  错误码      = %d" % neterr)
 
