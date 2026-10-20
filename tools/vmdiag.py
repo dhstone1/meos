@@ -196,6 +196,25 @@ def main():
         print("  最近 ping   = %s  往返 %d ms" % (ip4(lastip), rtt))
     if neterr:
         print("  错误码      = %d" % neterr)
+    print("")
+    print("文件系统（MeFS）")
+    fs_stage = u32(0x1C4)
+    fs_free = u32(0x1C8)
+    fs_err = u32(0x1CC)
+    fs_cmd = u32(0x1D0)
+    fs_bitmap = diag[0x1D4:0x1D4 + 48]
+    fs_cwd_raw = diag[0x204:0x244].split(b"\x00")[0]
+    try:
+        fs_cwd = fs_cwd_raw.decode("ascii")
+    except UnicodeDecodeError:
+        fs_cwd = "(乱码)"
+    print("  挂载状态    = %s" % ("已挂载" if fs_stage == 2 else "未挂载（%d）" % fs_stage))
+    print("  空闲块数    = %d" % fs_free)
+    print("  错误码      = %d" % fs_err)
+    print("  fs 命令数   = %d" % fs_cmd)
+    print("  当前目录    = %s" % fs_cwd)
+    marked = bin(int.from_bytes(fs_bitmap, "little")).count("1")
+    print("  位图前 384 块标记 = %d 块" % marked)
 
 
 

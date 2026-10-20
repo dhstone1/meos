@@ -21,3 +21,22 @@ build/
 # 内部技术文档：只放本地，不进仓库
 docs/技术文档.md
 tools/checkdoc.py
+# AI 工具/代理的本地数据 —— 不上传
+.env
+.agent/
+.agents/
+.claude/
+.trae/
+.github/
+.graphflow/
+.graphflow-cache/
+graphflow-out/
+skills-lock.json
+AGENTS.md
+GEMINI.md
+tools/__pycache__/
+
+# 一次性调试脚本
+tools/_*.py
+tools/_*.ps1
+tools/keys-test.txt

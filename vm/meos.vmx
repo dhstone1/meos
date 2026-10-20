@@ -30,3 +30,12 @@ ide1:0.deviceType = "cdrom-image"
 ide1:0.fileName = "meos.iso"
 ide1:0.startConnected = "TRUE"
 ide1:0.autodetect = "FALSE"
+
+# ext2 虚拟硬盘（Linux 文件系统移植，见 docs/Linux文件系统移植方案.md）：
+# 两文件 flat VMDK，由 tools/mkext2.py 在构建 2.5 步生成到 build/（与本
+# vmx 同目录，相对路径解析才找得到）。必须是 ide0:0 主盘——端口 0x1F0、
+# ATA 选盘位 0，FS2 的 PIO 驱动按主盘写；挂从盘驱动选盘就错。
+ide0:0.present = "TRUE"
+ide0:0.fileName = "hd.vmdk"
+ide0:0.mode = "persistent"
+ide0:0.startConnected = "TRUE"

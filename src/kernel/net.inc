@@ -267,8 +267,10 @@ RX_COUNT    equ 32                  ; 接收描述符个数
 TX_COUNT    equ 8                   ; 发送描述符个数
 NIC_BUF_SZ  equ 2048                ; 每个收包缓冲大小（BSIZE=2048）
 
-; 收发环和缓冲放在内核和栈之间的空地上（内核约 12KB，栈顶 0x7C000）
-NET_BASE    equ 0x10000
+; 收发环和缓冲放在内核和栈之间的空地上（栈顶 0x7C000）。
+; M5 起内核载荷长过了 0x10000（MeFS 代码 + 8KB 快照），基线整体挪到 0x20000，
+; 给内核留出 0x8000..0x20000 的成长空间。
+NET_BASE    equ 0x20000
 NIC_RX_RING equ NET_BASE + 0x0000   ; 32 × 16 = 512 字节
 NIC_TX_RING equ NET_BASE + 0x0200   ;  8 × 16 = 128 字节
 NIC_RX_BUF  equ NET_BASE + 0x1000   ; 32 × 2048 = 64KB

@@ -1,0 +1,8 @@
+Hello from ext2!
+
+This file does NOT live in the ramfs snapshot -- it lives on the
+virtual hard disk (hd.vmdk), written by tools/mkext2.py and read
+back through the ATA PIO + ext2 drivers.
+
+If you can read this with `cat /hd/hello.txt`, the whole chain
+works: shell -> vfs -> ext2 driver -> ATA -> VMware IDE disk.

@@ -60,17 +60,29 @@ if ($Clean -and (Test-Path -LiteralPath $BuildDir)) {
 New-Item -ItemType Directory -Force -Path $BuildDir, $IsoDir | Out-Null
 
 # ---- 1. 生成中文字模 -------------------------------------------------------
-Write-Host ('[1/5] 渲染点阵字模（32x32）：' + $Message) -ForegroundColor Cyan
+Write-Host ('[1/6] 渲染点阵字模（32x32）：' + $Message) -ForegroundColor Cyan
 & $Python (Join-Path $Root 'tools\genfont.py') $FontInc $Message 32
 if ($LASTEXITCODE -ne 0) { throw '字模生成失败' }
 
-# ---- 2. 引导扇区 -----------------------------------------------------------
-Write-Host '[2/5] 汇编引导扇区 ...' -ForegroundColor Cyan
+# ---- 2. 打包 MeFS 快照 ----------------------------------------------------
+Write-Host '[2/6] 打包 MeFS 快照（src/ramfs -> src/kernel/ramfs.inc）...' -ForegroundColor Cyan
+& $Python (Join-Path $Root 'tools\mkramfs.py')
+if ($LASTEXITCODE -ne 0) { throw 'MeFS 快照生成失败' }
+
+# ---- 2.5 ext2 虚拟硬盘（FS1：宿主侧生成 + 独立核验） ------------------------
+Write-Host '[2.5/6] 生成 ext2 虚拟硬盘（src/ext2root -> build/hd*.vmdk）...' -ForegroundColor Cyan
+& $Python (Join-Path $Root 'tools\mkext2.py')
+if ($LASTEXITCODE -ne 0) { throw 'ext2 硬盘镜像生成失败' }
+& $Python (Join-Path $Root 'tools\ext2check.py') (Join-Path $BuildDir 'hd-ext2.img')
+if ($LASTEXITCODE -ne 0) { throw 'ext2 硬盘镜像核验失败（裁判 ext2check.py）' }
+
+# ---- 3. 引导扇区 -----------------------------------------------------------
+Write-Host '[3/6] 汇编引导扇区 ...' -ForegroundColor Cyan
 & $Nasm -f bin (Join-Path $Root 'src\boot\boot.asm') -o (Join-Path $BuildDir 'boot.bin')
 if ($LASTEXITCODE -ne 0) { throw '引导扇区汇编失败' }
 
-# ---- 3. 内核载荷 -----------------------------------------------------------
-Write-Host '[3/5] 汇编内核载荷 ...' -ForegroundColor Cyan
+# ---- 4. 内核载荷 -----------------------------------------------------------
+Write-Host '[4/6] 汇编内核载荷 ...' -ForegroundColor Cyan
 $PayloadPath = Join-Path $BuildDir 'payload.bin'
 $NasmArgs = @('-f', 'bin', '-I', $KernelDir, $KernelAsm,
               '-o', $PayloadPath, '-l', (Join-Path $BuildDir 'kernel.lst'))
@@ -81,8 +93,8 @@ if ($SelfTest) {
 & $Nasm @NasmArgs
 if ($LASTEXITCODE -ne 0) { throw '内核载荷汇编失败' }
 
-# ---- 4. 软盘镜像 + 引导 ISO -------------------------------------------------
-Write-Host '[4/5] 生成软盘镜像与 ISO ...' -ForegroundColor Cyan
+# ---- 5. 软盘镜像 + 引导 ISO -------------------------------------------------
+Write-Host '[5/6] 生成软盘镜像与 ISO ...' -ForegroundColor Cyan
 $ImgPath = Join-Path $BuildDir 'meos.img'
 & $Python (Join-Path $Root 'tools\mkfloppy.py') (Join-Path $BuildDir 'boot.bin') $PayloadPath $ImgPath
 if ($LASTEXITCODE -ne 0) { throw '生成软盘镜像失败' }
@@ -92,8 +104,8 @@ $IsoPath = Join-Path $BuildDir 'meos.iso'
 & $Mkisofs -quiet -o $IsoPath -V 'MEOS' -b 'boot.img' $IsoDir
 if ($LASTEXITCODE -ne 0) { throw '生成 ISO 失败' }
 
-# ---- 5. 虚拟机配置 ---------------------------------------------------------
-Write-Host '[5/5] 准备 VMware 虚拟机配置 ...' -ForegroundColor Cyan
+# ---- 6. 虚拟机配置 ---------------------------------------------------------
+Write-Host '[6/6] 准备 VMware 虚拟机配置 ...' -ForegroundColor Cyan
 Copy-Item -LiteralPath (Join-Path $Root 'vm\meos.vmx') -Destination (Join-Path $BuildDir 'meos.vmx') -Force
 
 Write-Host ''

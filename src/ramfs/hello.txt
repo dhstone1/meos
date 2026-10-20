@@ -1,0 +1,2 @@
+Hello from MeOS!
+This is a RAM disk, baked into ramfs.inc at build time.

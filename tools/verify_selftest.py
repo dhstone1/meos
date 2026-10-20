@@ -127,6 +127,228 @@ def main():
     font_raw = parse_bytes(font_inc, "font_bitmap")
     banner_bits = sum(bin(b).count("1") for b in font_raw)
 
+    # ---- MeFS 快照：pwd / ls / cat 的输出从它里面读 --------------------------
+    #  布局和 mkramfs.py / fs.inc 里的约定是同一份：块 512B，首 4 字节 = 链上
+    #  下一块，目录记录 42 字节（kind/name_len/name(32)/first(4)/size(4)）。
+    ramfs_inc = read_src(os.path.join(ROOT, "src", "kernel", "ramfs.inc"))
+    snap = parse_bytes(ramfs_inc, "ramfs_snapshot")
+
+    def fs_block(n):
+        off = n * 512
+        return snap[off:off + 512]
+
+    def fs_dir_entries(block):
+        """按链顺序列出目录项 [(kind, name, first, size)]。"""
+        out = []
+        blk = block
+        while blk:
+            data = fs_block(blk)
+            nxt = struct.unpack_from("<I", data, 0)[0]
+            for off in range(4, 512 - 42 + 1, 42):
+                rec = data[off:off + 42]
+                nl = rec[1]
+                if nl == 0:
+                    continue
+                out.append((rec[0], rec[2:2 + nl].decode("ascii"),
+                            struct.unpack_from("<I", rec, 0x22)[0],
+                            struct.unpack_from("<I", rec, 0x26)[0]))
+            blk = nxt
+        return out
+
+    def fs_read_file(first, size):
+        out = bytearray()
+        blk = first
+        while size > 0 and blk:
+            data = fs_block(blk)
+            take = min(size, 508)
+            out += data[4:4 + take]
+            size -= take
+            blk = struct.unpack_from("<I", data, 0)[0]
+        return bytes(out)
+
+    fs_root_block = struct.unpack_from("<I", snap, 0x14)[0]
+
+    # ---- VFS 的静态事实，从 vfs.inc 里读回来 --------------------------------
+    #  挂载表 / 文件系统名 / 设备注册表 / 类型名，都是「数组里 dd 符号名 + 底下
+    #  db 字符串」两部分。跟内核一样表驱动，不在这另抄一份行为。
+    vfs_inc = read_src(os.path.join(ROOT, "src", "kernel", "vfs.inc"))
+
+    def follow_dd_table(text, label):
+        """抓 `label:` 后面连续 `dd 符号名` 形式的条目，到不是这种行就停。"""
+        lines = text.split("\n")
+        start = next(i for i, ln in enumerate(lines) if ln.strip() == label + ":")
+        names = []
+        for ln in lines[start + 1:]:
+            t = ln.strip()
+            if not t or t.startswith(";"):
+                continue
+            m = re.match(r"^dd\s+([A-Za-z_]\w*)", t)
+            if not m:
+                break
+            names.append(m.group(1))
+        return names
+
+    def db_label_strings(text):
+        out = {}
+        for m in re.finditer(r'^([A-Za-z_]\w*)\s+db\s+"([^"]*)"', text, re.M):
+            out[m.group(1)] = m.group(2)
+        return out
+
+    vfs_labels = db_label_strings(vfs_inc)
+    mnts = [vfs_labels[s] for s in follow_dd_table(vfs_inc, "vfs_mount_tab")]
+    fsnames = [vfs_labels[s] for s in follow_dd_table(vfs_inc, "vfs_fsname_tab")]
+    devnames = [vfs_labels[s] for s in follow_dd_table(vfs_inc, "devfs_ent")]
+    type_names = [vfs_labels[s] for s in follow_dd_table(vfs_inc, "vfs_type_msgs")]
+    cm = re.search(r'^devfs_console_text\s+db\s+"([^"]*)"([^\n]*)', vfs_inc, re.M)
+    console_text = cm.group(1) + ("\n" if "10" in cm.group(2) else "")
+    assert mnts and fsnames and devnames, "vfs.inc 解析失败"
+
+    # ---- 宿主机这边维护一棵可变文件树，模拟 touch/mkdir/cp/mv/rm 的副作用 ----
+    #  快照里的内容整个读进来当种子，之后写命令的操作就发生在这棵树上，
+    #  ls / cat / stat 都从它取数 —— 这样 "touch 建的 /t1.txt" 才解得开。
+    def load_tree(block):
+        d = {}
+        for kind, name, first, size in fs_dir_entries(block):
+            if kind == 1:
+                d[name] = ("dir", load_tree(first))
+            else:
+                d[name] = ("file", fs_read_file(first, size))
+        return d
+
+    root_dir = load_tree(fs_root_block)
+
+    # ---- ext2 硬盘模型：从 build/hd-ext2.img 直接解析一棵只读树 --------------
+    #  磁上的产物就是地面真值；目录顺序按磁盘顺序保留（dict 插入序 = 遍历序），
+    #  ls /hd 的输出顺序跟内核 ext2_readdir 的目录块遍历天然一致。
+    #  FS3 只支持直接块（12 块），这棵树也只走直接块——两边能力对齐。
+    e2root = {}
+    e2sz = {}
+    with open(os.path.join(ROOT, "build", "hd-ext2.img"), "rb") as _fp:
+        _fp.seek(1024)                   # 超块在块 1（1024B 盘），不在块 0
+        _sb = _fp.read(1024)
+        assert _sb[0x38:0x3A] == b"\x53\xEF", "ext2 魔数不对"
+        _bs = 1024 << struct.unpack("<I", _sb[0x18:0x1C])[0]
+        _fp.seek(2 * _bs)
+        _gd = _fp.read(_bs)
+        _inotab = struct.unpack("<I", _gd[8:12])[0]
+
+        def _e2_walk(ino, path):
+            _fp.seek(_inotab * _bs + (ino - 1) * 128)
+            i = _fp.read(128)
+            size = struct.unpack("<I", i[0x04:0x08])[0]   # i_size_lo（rev0 真偏移）
+            mode = struct.unpack("<H", i[0x00:0x02])[0]
+            blocks = struct.unpack("<12I", i[0x28:0x58])
+            data = b""
+            for b in blocks:
+                if b:
+                    _fp.seek(b * _bs)
+                    data += _fp.read(_bs)
+            data = data[:size]
+            e2sz[path] = size
+            if (mode & 0xF000) != 0x4000:
+                return data
+            d = {}
+            off = 0
+            while off + 8 <= len(data):
+                e_ino, rec = struct.unpack("<IH", data[off:off + 6])
+                nlen = data[off + 6]
+                if rec < 8 or rec % 4:
+                    break
+                if e_ino and nlen and off + 8 + nlen <= len(data):
+                    name = data[off + 8:off + 8 + nlen].decode("latin-1")
+                    if name not in (".", ".."):
+                        d[name] = _e2_walk(e_ino, path + "/" + name)
+                off += rec
+            return d
+
+        e2root = _e2_walk(2, "")
+
+    def e2_lookup(rel):
+        """rel 是相对挂载点 /hd 的路径（"" = 根）。返回 dict（目录）或 bytes（文件）。"""
+        node = e2root
+        for c in [c for c in rel.split("/") if c]:
+            if not isinstance(node, dict) or c not in node:
+                return None
+            node = node[c]
+        return node
+
+    def _e2_kindsize(rel):
+        node = e2_lookup(rel)
+        if node is None:
+            return None
+        if isinstance(node, dict):
+            return (1, e2sz.get(rel, 1024))
+        return (0, len(node))
+
+    def tree_node(path):
+        """逐级下落。返回 (父 dict, 名字, (kind, payload)) 或 None。"""
+        comps = [c for c in path.split("/") if c]
+        cur = root_dir
+        for c in comps[:-1]:
+            if not isinstance(cur, dict) or c not in cur or cur[c][0] != "dir":
+                return None
+            cur = cur[c][1]
+        if not comps or not isinstance(cur, dict) or comps[-1] not in cur:
+            return None
+        return (cur, comps[-1], cur[comps[-1]])
+
+    def tree_resolve(path):
+        t = tree_node(path)
+        if not t:
+            return None
+        kind, payload = t[2]
+        if kind == "file":
+            return (0, len(payload), payload)
+        return (1, len(payload), None)
+
+    def tree_parent(path):
+        """返回 (父目录 dict, 名字) 或 None。"""
+        comps = [c for c in path.split("/") if c]
+        cur = root_dir
+        for c in comps[:-1]:
+            if not isinstance(cur, dict) or c not in cur or cur[c][0] != "dir":
+                return None
+            cur = cur[c][1]
+        if not isinstance(cur, dict):
+            return None
+        return (cur, comps[-1] if comps else None)
+
+    def vfs_resolve(path):
+        """按挂载表最长前缀把路径拆给驱动，返回 (drv, rel, (kind, size))。"""
+        best, drv = -1, None
+        for i, mnt in enumerate(mnts):
+            if mnt == "/":
+                mlen = 1                 # 根挂载：任何绝对路径都中（和内核一致）
+            elif path == mnt or path.startswith(mnt + "/"):
+                mlen = len(mnt)
+            else:
+                continue
+            if mlen > best:
+                best, drv = mlen, i
+        if drv is None:
+            return None
+        rel = path[best:]
+        if drv == 0:
+            if rel == "":
+                return (0, "", (1, 0))   # 内核里根目录 vnode 的 size 恒 0
+            r = tree_resolve(rel)
+            if r:
+                return (0, rel, (r[0], r[1]))
+            return None
+        if drv == 2:
+            # ext2：目录 size 用 i_size（stat 语义跟内核 ext2_open 抄的 VN_SIZE 一致）
+            ks = _e2_kindsize(rel)
+            if ks:
+                return (2, rel, ks)
+            return None
+        name = rel.lstrip("/")
+        if name == "":
+            return (1, "", (1, len(devnames)))
+        if name in devnames:
+            size = len(console_text) if name == "console" else 0
+            return (1, name, (2, size))
+        return None
+
     # ---- 命令行的行为，从 kernel.asm 里读回来 ----
     msgs = db_strings(asm)
     prompt = msgs["msg_prompt"]
@@ -237,6 +459,131 @@ def main():
             varying[0] = False
         elif line.startswith("echo") and (len(line) == 4 or line[4] == " "):
             puts(line[5:] if len(line) > 4 else ""); newline()
+        elif line == "pwd":
+            # 自检流里没有 cd，cwd 恒为根目录
+            puts("/"); newline()
+        elif line == "mount":
+            for i, mnt in enumerate(mnts):
+                puts(fsnames[i] + " on " + mnt); newline()
+        elif line == "ls /dev" or line == "ls /dev/":
+            for name in devnames:
+                puts(name); newline()
+        elif line == "ls /hd" or line == "ls /hd/":
+            # ext2：按磁盘条目顺序回放（e2root 的插入序就是目录块遍历序），
+            # "." 和 ".." 内核那边吞掉了，这里也不列。
+            for name, v in e2root.items():
+                puts(name + ("/" if isinstance(v, dict) else "")); newline()
+        elif line.startswith("stat ") and len(line) > 5:
+            r = vfs_resolve(line[5:])
+            if r and r[2][0] < len(type_names):
+                tn = type_names[r[2][0]]
+            else:
+                tn = "unknown"
+            if r:
+                puts(tn + " size=" + str(r[2][1]) + " fs=" + fsnames[r[0]])
+                newline()
+            else:
+                puts(msgs["msg_unknown"] + line); newline()
+        elif line == "ls":
+            for name in sorted(root_dir):
+                kind = root_dir[name][0]
+                puts(name + ("/" if kind == "dir" else "")); newline()
+        elif line.startswith("touch "):
+            par = tree_parent(line[6:])
+            if par and par[1] not in par[0]:
+                par[0][par[1]] = ("file", b"")
+        elif line.startswith("mkdir "):
+            par = tree_parent(line[6:])
+            if par and par[1] not in par[0]:
+                par[0][par[1]] = ("dir", {})
+        elif line.startswith("rm "):
+            par = tree_parent(line[3:])
+            if par and par[1] in par[0]:
+                del par[0][par[1]]
+        elif line.startswith("cp ") and len(line.split()) == 3:
+            _, src, dst = line.split()
+            if dst == "/hd" or dst.startswith("/hd/"):
+                # FS4：cp 目标在 /hd → ext2 驱动（截断复用：同名覆盖、条目位置
+                # 不动 = dict 重赋值保持插入序，两边语义恰好一致）
+                r = tree_resolve(src)
+                node = e2root
+                parts = [p for p in dst[3:].split("/") if p]
+                ok = bool(parts) and r is not None and r[0] == 0
+                for p in parts[:-1]:
+                    node = node.get(p) if isinstance(node, dict) else None
+                    if not isinstance(node, dict):
+                        ok = False
+                        break
+                if ok:
+                    node[parts[-1]] = r[2]
+            else:
+                r = tree_resolve(src)
+                par = tree_parent(dst)
+                if r and par:
+                    if r[0] == 0:
+                        par[0][par[1]] = ("file", r[2])
+                    else:
+                        par[0][par[1]] = ("dir", r[2] if r[2] is not None else {})
+        elif line.startswith("mv ") and len(line.split()) == 3:
+            _, src, dst = line.split()
+            sp = tree_parent(src)
+            dp = tree_parent(dst)
+            if sp and sp[1] in sp[0] and dp:
+                dp[0][dp[1]] = sp[0].pop(sp[1])
+        elif line.startswith("cat ") and len(line) > 4:
+            path = line[4:]
+            if path == "/dev" or path.startswith("/dev/"):
+                # /dev 下的 cat 走 devfs 语义（空设备读到 EOF 无输出）
+                r = vfs_resolve(path)
+                if r and r[2][0] == 2:
+                    for ch in console_text if r[1] == "console" else "":
+                        if ch == "\n":
+                            newline()
+                        else:
+                            putc(ch)
+                else:
+                    puts(msgs["msg_unknown"] + line); newline()
+            else:
+                r = tree_resolve(path)
+                if r and r[0] == 0:
+                    text = r[2].decode("ascii")
+                    for ch in text:
+                        if ch == "\n":
+                            newline()
+                        else:
+                            putc(ch)
+                    if text and not text.endswith("\n"):
+                        newline()
+                elif (path == "/hd" or path.startswith("/hd/")) \
+                        and isinstance(e2_lookup(path[3:]), bytes):
+                    # ext2 文件：内容从磁盘镜像来，末行补换行的语义和 MeFS 分支一致
+                    text = e2_lookup(path[3:]).decode("ascii")
+                    for ch in text:
+                        if ch == "\n":
+                            newline()
+                        else:
+                            putc(ch)
+                    if text and not text.endswith("\n"):
+                        newline()
+                else:
+                    puts(msgs["msg_unknown"] + line); newline()
+        elif line == "disk":
+            # ata.inc 的 cmd_do_disk。型号串来自 IDENTIFY，是虚拟化环境的属性，
+            # 仓库里读不出来，只能照 VMware Workstation 的惯例抄一行，并把它
+            # 标成可变行（内容不比对，只占一行的排版）；换虚拟化环境要跟着改。
+            varying[0] = True
+            puts("ata0: VMware Virtual IDE Hard Drive"); newline()
+            varying[0] = False
+            # 容量和魔数有真值：盘的产物文件本身就是地面真值，从它读，别另抄。
+            flat = os.path.join(ROOT, "build", "hd-flat.vmdk")
+            img = os.path.join(ROOT, "build", "hd-ext2.img")
+            secs = os.path.getsize(flat) // 512
+            with open(img, "rb") as fp:
+                fp.seek(1024 + 0x38)
+                mag = fp.read(2)
+            puts("sectors: %d (%d MB)" % (secs, secs // 2048)); newline()
+            note = "ext2 magic ok" if mag == b"\x53\xEF" else "no ext2 magic"
+            puts("lba2+0x38: %02X %02X (%s)" % (mag[0], mag[1], note)); newline()
         else:
             puts(msgs["msg_unknown"] + line); newline()
 

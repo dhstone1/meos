@@ -113,6 +113,31 @@ D_NET_SCAN    equ 0x158            ; 8 个 dword：总线 0 上扫到的前 8 �
 D_NET_PKTLEN  equ 0x180            ; dword 最近收到那一帧的长度
 D_NET_PKT     equ 0x184            ; 16 个 dword：最近收到那一帧的前 64 字节
 
+; 文件系统（详见 fs.inc）
+D_FS_STAGE   equ 0x1C4            ; dword 0 = 未挂载，2 = 挂载好了
+D_FS_FREE    equ 0x1C8            ; dword 超块里的空闲块数
+D_FS_ERR     equ 0x1CC            ; dword 最近一次 fs 错误码
+D_FS_CMD     equ 0x1D0            ; dword 执行过的 fs 命令条数
+D_FS_BITMAP  equ 0x1D4            ; 12 个 dword：分配位图前 384 块的拷贝
+D_FS_CWD     equ 0x204            ; 64 字节：当前目录（ASCII）
+
+; ATA 硬盘（详见 ata.inc；0x244..0x2FF 与 0x500 的 fs 环形缓冲之间还有一大段空地）
+D_ATA_STAGE  equ 0x244            ; dword 0 = 未探测，1 = 复位过，2 = IDENTIFY 成功，3 = 扇区读通
+D_ATA_ERR    equ 0x248            ; dword 0 = 无错；bit0-7 = 状态寄存器，bit8 = 轮询超时
+D_ATA_LBA    equ 0x24C            ; dword 最近一次读写的起始 LBA
+D_ATA_COUNT  equ 0x250            ; dword 累计传输的扇区数
+
+; ext2 文件系统（详见 ext2.inc；0x254..0x268 之后到 0x500 的 fs 环形缓冲仍有一大段空地）
+D_EXT2_STAGE equ 0x254            ; dword 0 = 未挂载，1 = 超块读过，2 = 魔数 OK，3 = GD/inode 表定位，
+                                  ;        4 = 目录列得动（readdir），5 = 文件读通（read），6 = 写通（FS4）
+D_EXT2_ERR   equ 0x258            ; dword 最近一次失败的 fs_err（0 = 无错）
+D_EXT2_INO   equ 0x25C            ; dword 最近一次 open/readdir 命中的 inode 号
+D_EXT2_BLK   equ 0x260            ; dword 最近一次读的块号
+D_EXT2_FREE  equ 0x264            ; dword 挂载时的 s_free_blocks_count（df 的 /hd 行读这里）
+D_EXT2_CMD   equ 0x268            ; dword 挂载后驱动接口被调用的累计次数
+D_EXVEC      equ 0x3A0            ; dword（用到低字节）最后落进异常存根的向量号：
+                                  ;        0 = 没异常过（内存初始为零），0x01-0x1F = CPU 异常号，0xFE = 未注册向量
+
 ; ============================================================================
 ;  一、16 位实模式
 ; ============================================================================
@@ -415,6 +440,10 @@ pm_entry:
     mov dword [DIAG_ADDR + D_STAGE], 1
     call probe_hardware
     call net_probe                      ; 找网卡，先把 PCI 信息记下来
+    call fs_init                        ; 把 MeFS 快照拷进 1MB 并核对超块
+    call vfs_init                       ; 装配挂载表（/ → MeFS，/dev → devfs）并清 fd 表
+    call ata_init                       ; 探一下 IDE 主盘（复位 + IDENTIFY；失败软着陆）
+    call ext2_init                      ; 挂 ext2（读超块验魔数；失败软着陆，不挡启动）
     mov dword [DIAG_ADDR + D_STAGE], 2
     call con_init
     call clear_screen
@@ -519,6 +548,18 @@ setup_idt:
     mov eax, 0x21                       ; IRQ1 键盘
     mov edx, kbd_isr
     call set_idt_gate
+    ; 0..31 号 CPU 异常各挂一个带向量号的记录存根（idt_vec0..idt_vec31）：
+    ; 异常号会落到诊断块 D_EXVEC（0x3A0），宿主机从 .vmem 就能读出是哪号异常
+    mov eax, 0
+    mov edx, idt_vec0
+.vgate:
+    push eax
+    call set_idt_gate
+    pop eax
+    inc eax
+    add edx, (idt_vec1 - idt_vec0)      ; 每个存根等长
+    cmp eax, 32
+    jb .vgate
     lidt [idt_descriptor]
     ret
 
@@ -543,8 +584,16 @@ set_idt_gate:
 
 ; 异常处理程序：在屏幕顶上刷一条红杠再停住，一眼就能看出是「CPU 出事了」
 ; 而不是「画面没画出来」。32 位色下字节序是 B,G,R,X，红要写在第 3 个字节。
+; 挂死前先把向量号记进诊断块 D_EXVEC（0x3A0）：黑屏环境里红杠看不见，
+; .vmem 里只读得到低 256MB（帧缓冲在 0xE8000000 读不到），向量号是唯一线索。
 idt_stub:
     cli
+    mov byte [DIAG_ADDR + D_EXVEC], 0xFE        ; 0xFE = 走了未注册向量的通用存根
+    jmp idt_bar
+idt_hang:
+    hlt
+    jmp idt_hang
+idt_bar:
     mov edi, [PARAM_ADDR + P_FB]
     movzx eax, word [PARAM_ADDR + P_PITCH]
     shl eax, 3                                  ; 前 8 行像素
@@ -553,9 +602,17 @@ idt_stub:
     mov eax, 0x00FF0000
     cld
     rep stosd
-.hang:
-    hlt
-    jmp .hang
+    jmp idt_hang
+
+; 0..31 号异常各自的记录存根：把向量号写进 D_EXVEC 再去刷红杠挂死
+%assign _v 0
+%rep 32
+idt_vec%[_v]:
+    cli
+    mov byte [DIAG_ADDR + D_EXVEC], _v
+    jmp idt_bar
+%assign _v _v+1
+%endrep
 
 ; ---- 用黑色填满整块帧缓冲 -----------------------------------------------------
 clear_screen:
@@ -1452,7 +1509,7 @@ shell_exec:
     mov ecx, 4
     call str_n_eq
     test eax, eax
-    jz .unknown
+    jz .fs_cmds                         ; 不是 echo，落到下面的文件系统命令链
     movzx eax, byte [line_buf + 4]      ; "echo" 后面要么就此结束，要么跟个空格
     test al, al
     jz .echo_blank
@@ -1466,6 +1523,65 @@ shell_exec:
     call con_crlf
     jmp .done
 
+; ---- 文件系统命令（实现都在 fs.inc 里）----------------------------------------
+;  FS_CMD0：无参命令，整行匹配。
+;  FS_CMD ：带参命令，整行 = 无参数（命令自己打 usage），前缀 + 空格 = 传参。
+%macro FS_CMD0 2
+    mov esi, line_buf
+    mov edi, %1
+    call str_eq
+    test eax, eax
+    jz %%next
+    call %2
+    jmp .done
+%%next:
+%endmacro
+%macro FS_CMD 3
+    mov esi, line_buf
+    mov edi, %1
+    call str_eq
+    test eax, eax
+    jz %%arg
+    xor esi, esi
+    call %3
+    jmp .done
+%%arg:
+    mov esi, line_buf
+    mov edi, %1
+    mov ecx, %2
+    call str_n_eq
+    test eax, eax
+    jz %%next
+    cmp byte [line_buf + %2], ' '
+    jne %%next
+    mov esi, line_buf + %2 + 1
+    call %3
+    jmp .done
+%%next:
+%endmacro
+
+.fs_cmds:
+    FS_CMD0 cmd_pwd,   cmd_do_pwd
+    FS_CMD0 cmd_df,    cmd_do_df
+    FS_CMD  cmd_ls,    2, cmd_do_ls
+    FS_CMD  cmd_cd,    2, cmd_do_cd
+    FS_CMD  cmd_cat,   3, cmd_do_cat
+    FS_CMD  cmd_touch, 5, cmd_do_touch
+    FS_CMD  cmd_mkdir, 5, cmd_do_mkdir
+    FS_CMD  cmd_rm,    2, cmd_do_rm
+    FS_CMD  cmd_cp,    2, cmd_do_cp
+    FS_CMD  cmd_mv,    2, cmd_do_mv
+    FS_CMD0 cmd_mount, cmd_do_mount
+    FS_CMD  cmd_stat,  4, cmd_do_stat
+    FS_CMD0 cmd_disk,  cmd_do_disk      ; ata.inc：盘在不在 / 型号 / 容量 / ext2 魔数
+    ; 走到这里 = 不是任何已知命令
+.unknown:
+    mov esi, msg_unknown
+    call con_puts
+    mov esi, line_buf
+    call con_puts
+    call con_crlf
+    jmp .done
 .help:
     mov esi, msg_help
     call con_puts
@@ -1479,12 +1595,6 @@ shell_exec:
 .cls:
     call con_clear_all
     jmp .done
-.unknown:
-    mov esi, msg_unknown
-    call con_puts
-    mov esi, line_buf
-    call con_puts
-    call con_crlf
 .done:
     popad
     ret
@@ -1651,28 +1761,69 @@ line_len    dd 0
 
 
 %ifdef SELFTEST
-; 预置的扫描码流，对应的正是这六行：
+; 预置的扫描码流，对应的正是这几行：
 ;   help
 ;   echo typing works
 ;   MeOS 1234
 ;   ver
 ;   ping baidu.com
 ;   net
+;   pwd
+;   ls
+;   cat /etc/motd
 selftest_ptr  dd 0
 selftest_verified db 0
-selftest_len  equ 62
+selftest_len  equ 271
 selftest_data:
-    db 0x23, 0x12, 0x26, 0x19, 0x1C, 0x12, 0x2E, 0x23, 0x18, 0x39, 0x14, 0x15
-    db 0x19, 0x17, 0x31, 0x22, 0x39, 0x11, 0x18, 0x13, 0x25, 0x1F, 0x1C, 0x2A
-    db 0x32, 0xAA, 0x12, 0x2A, 0x18, 0xAA, 0x2A, 0x1F, 0xAA, 0x39, 0x02, 0x03
-    db 0x04, 0x05, 0x1C, 0x2F, 0x12, 0x13, 0x1C, 0x19, 0x17, 0x31, 0x22, 0x39
-    db 0x30, 0x1E, 0x17, 0x20, 0x16, 0x34, 0x2E, 0x18, 0x32, 0x1C, 0x31, 0x12
-    db 0x14, 0x1C
+    ; help
+    db 0x23, 0x12, 0x26, 0x19, 0x1C
+    ; pwd
+    db 0x19, 0x11, 0x20, 0x1C
+    ; ls
+    db 0x26, 0x1F, 0x1C
+    ; cat /etc/motd
+    db 0x2E, 0x1E, 0x14, 0x39, 0x35, 0x12, 0x14, 0x2E, 0x35, 0x32, 0x18, 0x14, 0x20, 0x1C
+    ; touch /t1.txt
+    db 0x14, 0x18, 0x16, 0x2E, 0x23, 0x39, 0x35, 0x14, 0x02, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; mkdir /d1
+    db 0x32, 0x25, 0x20, 0x17, 0x13, 0x39, 0x35, 0x20, 0x02, 0x1C
+    ; cp /hello.txt /c1.txt
+    db 0x2E, 0x19, 0x39, 0x35, 0x23, 0x12, 0x26, 0x26, 0x18, 0x34, 0x14, 0x2D, 0x14, 0x39, 0x35, 0x2E, 0x02, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; mv /c1.txt /m1.txt
+    db 0x32, 0x2F, 0x39, 0x35, 0x2E, 0x02, 0x34, 0x14, 0x2D, 0x14, 0x39, 0x35, 0x32, 0x02, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; rm /m1.txt
+    db 0x13, 0x32, 0x39, 0x35, 0x32, 0x02, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; cat /t1.txt（touch 建的空文件，无输出）
+    db 0x2E, 0x1E, 0x14, 0x39, 0x35, 0x14, 0x02, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; mount（VFS 挂载表：mefs on /、devfs on /dev）
+    db 0x32, 0x18, 0x16, 0x31, 0x14, 0x1C
+    ; stat /hello.txt（VFS 跨挂载 stat：file size=.. fs=mefs）
+    db 0x1F, 0x14, 0x1E, 0x14, 0x39, 0x35, 0x23, 0x12, 0x26, 0x26, 0x18, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; ls /dev（devfs 枚举：null、console）
+    db 0x26, 0x1F, 0x39, 0x35, 0x20, 0x12, 0x2F, 0x1C
+    ; cat /dev/null（空设备，无输出）
+    db 0x2E, 0x1E, 0x14, 0x39, 0x35, 0x20, 0x12, 0x2F, 0x35, 0x31, 0x16, 0x26, 0x26, 0x1C
+    ; cat /dev/console（设备文件：读出一段欢迎语）
+    db 0x2E, 0x1E, 0x14, 0x39, 0x35, 0x20, 0x12, 0x2F, 0x35, 0x2E, 0x18, 0x31, 0x1F, 0x18, 0x26, 0x12, 0x1C
+    ; disk（FS2：IDENTIFY 缓存 + LBA2 读通 + ext2 魔数）
+    db 0x20, 0x17, 0x1F, 0x25, 0x1C     ; d=0x20（0x23 是 h！"hisk" 教训）
+    ; ls /hd（FS3：ext2 根目录 readdir —— etc、hello.txt、readme.txt）
+    db 0x26, 0x1F, 0x39, 0x35, 0x23, 0x20, 0x1C
+    ; cat /hd/hello.txt（ext2 文件读通：315B 全文）
+    db 0x2E, 0x1E, 0x14, 0x39, 0x35, 0x23, 0x20, 0x35, 0x23, 0x12, 0x26, 0x26, 0x18, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; stat /hd/hello.txt（跨挂载 stat：file size=315 fs=ext2）
+    db 0x1F, 0x14, 0x1E, 0x14, 0x39, 0x35, 0x23, 0x20, 0x35, 0x23, 0x12, 0x26, 0x26, 0x18, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; cp /hello.txt /hd/c1.txt（FS4：MeFS→ext2 跨文件系统拷贝 = create+write）
+    db 0x2E, 0x19, 0x39, 0x35, 0x23, 0x12, 0x26, 0x26, 0x18, 0x34, 0x14, 0x2D, 0x14, 0x39, 0x35, 0x23, 0x20, 0x35, 0x2E, 0x02, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; cat /hd/c1.txt（写完读回：内容应与 /hello.txt 一致，73B）
+    db 0x2E, 0x1E, 0x14, 0x39, 0x35, 0x23, 0x20, 0x35, 0x2E, 0x02, 0x34, 0x14, 0x2D, 0x14, 0x1C
+    ; ls /hd（根目录多了 c1.txt —— 持久化前的落盘验证靠 ext2check，这里看列表）
+    db 0x26, 0x1F, 0x39, 0x35, 0x23, 0x20, 0x1C
 %endif
 
 msg_prompt  db "meos> ", 0
-msg_help    db "commands: help  ver  echo <text>  cls  net  ping <host>", 0
-msg_ver     db "MeOS 0.2 (M2) - 32-bit protected mode, PS/2 keyboard", 0
+msg_help    db "core: help ver echo <text> cls | net: net ping <host> | fs: ls cat touch mkdir rm pwd cd cp mv df | vfs: mount stat | hd: disk", 0
+msg_ver     db "MeOS 0.3 (M5) - 32-bit protected mode, PS/2 keyboard, MeFS ramdisk", 0
 msg_unknown db "unknown command: ", 0
 cmd_help    db "help", 0
 cmd_ver     db "ver", 0
@@ -1680,6 +1831,17 @@ cmd_cls     db "cls", 0
 cmd_echo    db "echo", 0
 cmd_ping    db "ping", 0
 cmd_net     db "net", 0
+cmd_ls      db "ls", 0
+cmd_cd      db "cd", 0
+cmd_pwd     db "pwd", 0
+cmd_cat     db "cat", 0
+cmd_touch   db "touch", 0
+cmd_mkdir   db "mkdir", 0
+cmd_rm      db "rm", 0
+cmd_cp      db "cp", 0
+cmd_mv      db "mv", 0
+cmd_df      db "df", 0
+cmd_disk    db "disk", 0
 msg_ping_usage db "usage: ping <host|ip>", 0
 
 msg_resolving db "resolving ", 0
@@ -1716,3 +1878,8 @@ msg_crlf     db 13, 10, 0
 %include "net.inc"
 %include "font.inc"
 %include "ascii.inc"
+%include "ramfs.inc"    ; MeFS 快照（tools/mkramfs.py 生成，勿手改）
+%include "fs.inc"       ; MeFS 文件系统 + 文件命令
+%include "vfs.inc"      ; VFS：挂载表 / vnode / fd / 驱动表（MeFS 驱动 + devfs）
+%include "ata.inc"      ; ATA/IDE PIO 轮询驱动 + disk 命令（FS2）
+%include "ext2.inc"     ; Linux ext2 rev0 只读驱动（FS3）
