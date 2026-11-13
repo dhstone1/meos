@@ -14,8 +14,8 @@
 BITS 16                         ; 16 位实模式
 ORG 0x7C00                      ; BIOS 约定的加载地址
 
-PAYLOAD_SECTORS   equ 128       ; 装入 128 个扇区（64KB）给内核用（MeFS 快照 + ext2 移植预算）。
-                                ; 约束链：0x8000 + 128*512 = 0x18000 必须低于 net.inc 的
+PAYLOAD_SECTORS   equ 176       ; 装入 176 个扇区（88KB）给内核用（多出的预算给 vi 编辑器）。
+                                ; 约束链：0x8000 + 176*512 = 0x1E000 必须低于 net.inc 的
                                 ; NET_BASE(0x20000，网卡收发环)，且远低于栈顶 0x7C000。
                                 ; 改这里必须同步 tools/checkdoc.py 的 CONSTS（PAYLOAD_SECTORS 行）。
 SECTORS_PER_TRACK equ 18        ; 1.44MB 软盘：每磁道 18 个扇区

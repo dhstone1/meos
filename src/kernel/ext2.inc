@@ -1113,6 +1113,101 @@ ext2_dir_insert:
     popad
     ret
 
+; ---- ext2_truncate_inode：EAX = inode 号 → EAX = 1/0 -------------------------
+;  释放直接块与一级间接块，清 size / blocks / i_block，保留 inode 本身。
+;  只处理普通文件；双/三级间接未支持，遇到就报 NOTSUPP，避免漏释放。
+ext2_truncate_inode:
+    pushad
+    cld
+    cmp  dword [ext2_ready], 1
+    jne  .notrdy
+    mov  [e2tr_ino], eax
+    call ext2_read_inode
+    test eax, eax
+    jz   .fail
+    movzx eax, word [ext2_ino_buf + I_MODE]
+    shr  eax, 12
+    cmp  eax, 8
+    jne  .isdir
+    mov  eax, [ext2_ino_buf + I_BLOCK + 13 * 4]
+    or   eax, [ext2_ino_buf + I_BLOCK + 14 * 4]
+    jnz  .supp
+    xor  ebx, ebx
+.dir:
+    mov  eax, [ext2_ino_buf + I_BLOCK + ebx * 4]
+    test eax, eax
+    jz   .dir_next
+    call ext2_free_block
+    test eax, eax
+    jz   .fail
+    mov  dword [ext2_ino_buf + I_BLOCK + ebx * 4], 0
+.dir_next:
+    inc  ebx
+    cmp  ebx, E2_MAX_DIRECT
+    jb   .dir
+    mov  eax, [ext2_ino_buf + I_BLOCK + 12 * 4]
+    test eax, eax
+    jz   .zero
+    mov  [e2tr_tmp], eax
+    call ext2_read_block
+    test eax, eax
+    jz   .io
+    mov  esi, ext2_blk_buf
+    mov  edi, ext2_ind_buf
+    mov  ecx, 256
+    rep  movsd
+    xor  ebx, ebx
+.ind:
+    mov  eax, [ext2_ind_buf + ebx * 4]
+    test eax, eax
+    jz   .ind_next
+    call ext2_free_block
+    test eax, eax
+    jz   .fail
+.ind_next:
+    inc  ebx
+    cmp  ebx, 256
+    jb   .ind
+    mov  eax, [e2tr_tmp]
+    call ext2_free_block
+    test eax, eax
+    jz   .fail
+.zero:
+    mov  dword [ext2_ino_buf + I_SIZE], 0
+    mov  dword [ext2_ino_buf + I_BLOCKS], 0
+    mov  dword [ext2_ino_buf + I_BLOCK + 12 * 4], 0
+    mov  dword [ext2_ino_buf + I_BLOCK + 13 * 4], 0
+    mov  dword [ext2_ino_buf + I_BLOCK + 14 * 4], 0
+    mov  eax, [e2tr_ino]
+    call ext2_write_inode
+    test eax, eax
+    jz   .fail
+    call ext2_sync_super
+    test eax, eax
+    jz   .fail
+    mov  dword [fs_err], FS_OK
+    mov  dword [DIAG_ADDR + D_EXT2_ERR], 0
+    mov  dword [esp + 28], 1
+    popad
+    ret
+.isdir:
+    mov  dword [fs_err], FS_ISDIR
+    jmp  .fail
+.supp:
+    mov  dword [fs_err], FS_NOTSUPP
+    jmp  .fail
+.notrdy:
+    mov  dword [fs_err], FS_IO
+    jmp  .fail
+.io:
+    mov  dword [fs_err], FS_IO
+.fail:
+    mov  eax, [fs_err]
+    mov  [DIAG_ADDR + D_EXT2_ERR], eax
+    mov  dword [esp + 28], 0
+    popad
+    ret
+
 ; ---- ext2_create：ESI = 相对路径，EAX = kind（0 文件 1 目录）→ 1/0 ----------
 ;  驱动表 VIA_CREATE 列。文件已存在 → 截断复用（cp 覆盖语义，跨重启幂等）；
 ;  目录已存在 → FS_EXIST。挂进父目录 + 计数落盘。
@@ -1304,14 +1399,9 @@ ext2_create:
     mov  [e2ci_ino], eax
     cmp  dword [e2ci_kind], 0
     jne  .exist_dir
-    ; 文件存在 → 截断复用（保持 inode 和块，只清 size；随后的 write 从 0 长回）
+    ; 文件存在 → 截断复用（释放旧块并清 size；随后的 write 重新分配）
     mov  eax, [e2ci_ino]
-    call ext2_read_inode
-    test eax, eax
-    jz   .fail
-    mov  dword [ext2_ino_buf + I_SIZE], 0
-    mov  eax, [e2ci_ino]
-    call ext2_write_inode
+    call ext2_truncate_inode
     test eax, eax
     jz   .fail
     mov  dword [esp + 28], 1
@@ -1850,6 +1940,9 @@ e2un_blk        dd 0            ; 条目所在块
 e2un_off        dd 0            ; 条目块内偏移
 e2un_rec        dd 0            ; 条目 rec_len
 e2un_tmp        dd 0            ; 间接块号暂存
+
+e2tr_ino        dd 0            ; truncate 目标 ino
+e2tr_tmp        dd 0            ; truncate 间接块号暂存
 
 e2wr_fd         dd 0
 e2wr_src        dd 0

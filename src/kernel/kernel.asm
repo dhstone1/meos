@@ -134,6 +134,7 @@ D_EXT2_ERR   equ 0x258            ; dword 最近一次失败的 fs_err（0 = 无
 D_EXT2_INO   equ 0x25C            ; dword 最近一次 open/readdir 命中的 inode 号
 D_EXT2_BLK   equ 0x260            ; dword 最近一次读的块号
 D_EXT2_FREE  equ 0x264            ; dword 挂载时的 s_free_blocks_count（df 的 /hd 行读这里）
+D_VI_TEST    equ 0x28C            ; dword vi 非交互自测：0x600D=全过，其余=失败步骤（仅 -dVI_TEST）
 D_EXT2_CMD   equ 0x268            ; dword 挂载后驱动接口被调用的累计次数
 D_EXVEC      equ 0x3A0            ; dword（用到低字节）最后落进异常存根的向量号：
                                   ;        0 = 没异常过（内存初始为零），0x01-0x1F = CPU 异常号，0xFE = 未注册向量
@@ -444,6 +445,9 @@ pm_entry:
     call vfs_init                       ; 装配挂载表（/ → MeFS，/dev → devfs）并清 fd 表
     call ata_init                       ; 探一下 IDE 主盘（复位 + IDENTIFY；失败软着陆）
     call ext2_init                      ; 挂 ext2（读超块验魔数；失败软着陆，不挡启动）
+%ifdef VI_TEST
+    call vi_selftest                    ; 只在本机构建：非交互验证 vi 存盘/截断/删除
+%endif
     mov dword [DIAG_ADDR + D_STAGE], 2
     call con_init
     call clear_screen
@@ -858,7 +862,7 @@ kbd_handle_scancode:
     cmp bl, 0xE0                        ; 扩展键前缀：记住，下个字节一起丢掉
     jne .not_ext
     mov byte [kb_ext], 1
-    jmp .done
+    jmp .ret                            ; 不能走 .done：那里会把 kb_ext 清掉
 .not_ext:
     mov al, bl
     and al, 0x7F                        ; 去掉松键标志，留下键号
@@ -884,7 +888,58 @@ kbd_handle_scancode:
     cmp al, 0x3A
     je .caps
     cmp byte [kb_ext], 0
-    jne .done                           ; 扩展键本阶段不处理
+    je  .normal_key
+    ; ---- 扩展键（0xE0 前缀）：方向键 / Delete / Home / End / PgUp / PgDn ----
+    test bl, 0x80
+    jnz .done                           ; 松键不产生字符
+    cmp al, 0x4B
+    jne .ext_right
+    mov al, 0x80                        ; 左
+    jmp .ext_push
+.ext_right:
+    cmp al, 0x4D
+    jne .ext_up
+    mov al, 0x81                        ; 右
+    jmp .ext_push
+.ext_up:
+    cmp al, 0x48
+    jne .ext_down
+    mov al, 0x82                        ; 上
+    jmp .ext_push
+.ext_down:
+    cmp al, 0x50
+    jne .ext_del
+    mov al, 0x83                        ; 下
+    jmp .ext_push
+.ext_del:
+    cmp al, 0x53
+    jne .ext_home
+    mov al, 0x84                        ; Delete
+    jmp .ext_push
+.ext_home:
+    cmp al, 0x47
+    jne .ext_end
+    mov al, 0x85                        ; Home
+    jmp .ext_push
+.ext_end:
+    cmp al, 0x4F
+    jne .ext_pgup
+    mov al, 0x86                        ; End
+    jmp .ext_push
+.ext_pgup:
+    cmp al, 0x49
+    jne .ext_pgdn
+    mov al, 0x87                        ; PgUp
+    jmp .ext_push
+.ext_pgdn:
+    cmp al, 0x51
+    jne .done
+    mov al, 0x88                        ; PgDn
+.ext_push:
+    inc dword [DIAG_ADDR + D_KB_CHARS]
+    call kbd_ring_push
+    jmp .done
+.normal_key:
     movzx eax, al
     cmp byte [kb_shift], 0
     je .use_lo
@@ -906,6 +961,7 @@ kbd_handle_scancode:
     xor byte [kb_caps], 1               ; 大写锁定：按一下翻一次
 .done:
     mov byte [kb_ext], 0
+.ret:
     pop ebx
     pop eax
     ret
@@ -1571,6 +1627,7 @@ shell_exec:
     FS_CMD  cmd_rm,    2, cmd_do_rm
     FS_CMD  cmd_cp,    2, cmd_do_cp
     FS_CMD  cmd_mv,    2, cmd_do_mv
+    FS_CMD  cmd_vi,    2, cmd_do_vi
     FS_CMD0 cmd_mount, cmd_do_mount
     FS_CMD  cmd_stat,  4, cmd_do_stat
     FS_CMD0 cmd_disk,  cmd_do_disk      ; ata.inc：盘在不在 / 型号 / 容量 / ext2 魔数
@@ -1699,14 +1756,14 @@ msg_y0     dd 0
 ; ---- 键盘扫描码表（集 1）：下标就是去掉最高位的扫描码 -------------------------
 ;  两张表的区别只有 Shift 按住时的符号和大小写；0 表示这个键不产生字符。
 kbd_map_lo:
-    db 0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 8, 9
+    db 0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 8, 9
     db 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', 13, 0, 'a', 's'
     db 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', 0x27, '`', 0, 0x5C, 'z', 'x', 'c', 'v'
     db 'b', 'n', 'm', ',', '.', '/', 0, 0, 0, ' ', 0, 0, 0, 0, 0, 0
     times 64 db 0
 
 kbd_map_hi:
-    db 0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 8, 9
+    db 0, 27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 8, 9
     db 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', 13, 0, 'A', 'S'
     db 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', 0x22, '~', 0, 0x7C, 'Z', 'X', 'C', 'V'
     db 'B', 'N', 'M', '<', '>', '?', 0, 0, 0, ' ', 0, 0, 0, 0, 0, 0
@@ -1834,7 +1891,7 @@ selftest_data:
 %endif
 
 msg_prompt  db "meos> ", 0
-msg_help    db "core: help ver echo <text> cls | net: net ping <host> | fs: ls cat touch mkdir rm pwd cd cp mv df | vfs: mount stat | hd: disk", 0
+msg_help    db "core: help ver echo <text> cls | net: net ping <host> | fs: ls cat touch mkdir rm pwd cd cp mv df vi | vfs: mount stat | hd: disk", 0
 msg_ver     db "MeOS 0.3 (M5) - 32-bit protected mode, PS/2 keyboard, MeFS ramdisk", 0
 msg_unknown db "unknown command: ", 0
 cmd_help    db "help", 0
@@ -1852,6 +1909,7 @@ cmd_mkdir   db "mkdir", 0
 cmd_rm      db "rm", 0
 cmd_cp      db "cp", 0
 cmd_mv      db "mv", 0
+cmd_vi      db "vi", 0
 cmd_df      db "df", 0
 cmd_disk    db "disk", 0
 msg_ping_usage db "usage: ping <host|ip>", 0
@@ -1895,3 +1953,4 @@ msg_crlf     db 13, 10, 0
 %include "vfs.inc"      ; VFS：挂载表 / vnode / fd / 驱动表（MeFS 驱动 + devfs）
 %include "ata.inc"      ; ATA/IDE PIO 轮询驱动 + disk 命令（FS2）
 %include "ext2.inc"     ; Linux ext2 rev0 只读驱动（FS3）
+%include "vi.inc"       ; vi 风格最小模态编辑器（只写 ext2 /hd）
