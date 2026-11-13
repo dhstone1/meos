@@ -1600,36 +1600,36 @@ cmd_do_cd:
     mov  dword [fs_err], FS_OK
     jmp  .done
 .path:
-    call fs_path_lookup
+    ; FS5：cwd 走 VFS 统一路径，/hd 等非根挂载也能进
+    call vfs_open
     test eax, eax
-    jz   .perr
-    cmp  byte [fs_ent_kind], KIND_DIR
-    je   .isdir
-    mov  dword [fs_err], FS_NOTDIR
-    jmp  .perr
-.isdir:
-    ; 把规范化好的绝对路径抄进 cwd_buf（64 字节区，路径解析不保证短于 64）
+    js   .perr
+    mov  [fs_tmp0], eax
+    call vfs_fd_ptr
+    cmp  byte [eax + FD_VN + VN_KIND], VN_DIR
+    jne  .notdir
+    mov  eax, [fs_tmp0]
+    call vfs_close
+    ; path_buf = 规范化后的绝对路径；cwd_buf 只有 64 字节，截断也保证 0 结尾
     lea  esi, [path_buf]
     lea  edi, [cwd_buf]
-    xor  ecx, ecx
+    mov  ecx, 63
 .cp:
-    mov  al, [esi]
-    mov  [edi], al
-    inc  esi
-    inc  edi
-    inc  ecx
+    lodsb
+    stosb
     test al, al
     jz   .cpend
-    cmp  ecx, 63
-    jae  .cpend
-    jmp  .cp
+    dec  ecx
+    jnz  .cp
+    mov  byte [edi], 0
 .cpend:
-    mov  eax, [fs_ent_first]
-    mov  [fs_cur_dir], eax
-    mov  eax, [fs_dirent_addr]
-    mov  [fs_cur_rec], eax
     mov  dword [fs_err], FS_OK
     jmp  .done
+.notdir:
+    mov  eax, [fs_tmp0]
+    call vfs_close
+    mov  dword [fs_err], FS_NOTDIR
+    jmp  .perr
 .perr:
     call fs_perror
 .done:
@@ -1731,11 +1731,11 @@ cmd_do_touch:
     call vfs_mount_match
     cmp  eax, DRV_EXT2
     jne  .meos
-    lea  esi, [path_buf]
+    mov  esi, [fs_tmp0]
     call vfs_open
     test eax, eax
     jns  .hd_have                        ; 已存在（文件或目录）= 无事可做
-    lea  esi, [path_buf]
+    mov  esi, [fs_tmp0]
     mov  eax, KIND_FILE
     call vfs_create                      ; 不存在 → 建空文件
     test eax, eax
@@ -1781,7 +1781,7 @@ cmd_do_mkdir:
     call vfs_mount_match
     cmp  eax, DRV_EXT2
     jne  .meos
-    lea  esi, [path_buf]
+    mov  esi, [fs_tmp0]
     mov  eax, KIND_DIR
     call vfs_create                      ; 已存在 → FS_EXIST → .perr（语义正好）
     test eax, eax
@@ -1813,7 +1813,7 @@ cmd_do_rm:
     jz   .done
     test esi, esi
     jz   .usage
-    ; ---- FS4：目标在 /hd 下 → 显式不支持（ext2 删除是 FS5）----
+    ; ---- FS5：目标在 /hd 下 → VFS unlink（ext2 删普通文件）----
     mov  [fs_tmp0], esi
     call fs_action
     test eax, eax
@@ -1822,8 +1822,13 @@ cmd_do_rm:
     call vfs_mount_match
     cmp  eax, DRV_EXT2
     jne  .meos
-    mov  dword [fs_err], FS_NOTSUPP
-    jmp  .perr
+    ; 必须传原始参数：vfs_unlink 内部会再跑 fs_action，而 fs_action 先清
+    ; path_buf 再读源指针；传 path_buf 会自别名，路径被归一化成根。
+    mov  esi, [fs_tmp0]
+    call vfs_unlink
+    test eax, eax
+    jz   .perr
+    jmp  .done
 .meos:
     mov  esi, [fs_tmp0]
     call fs_resolve_parent

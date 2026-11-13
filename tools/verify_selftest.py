@@ -397,6 +397,16 @@ def main():
     varying = [False]
     scrolled = [0]                      # 滚屏次数，横幅要跟着一起上移
     state = {"x": 0, "y": top_row}
+    cwd = ["/"]
+
+    def abs_path(p):
+        """相对路径按当前 cwd 拼绝对路径（cd 之后的自检命令要用）。"""
+        if not p:
+            return cwd[0]
+        if p.startswith("/"):
+            return p
+        base = cwd[0]
+        return base.rstrip("/") + "/" + p if base != "/" else "/" + p
 
     def newline():
         state["x"] = 0
@@ -460,8 +470,22 @@ def main():
         elif line.startswith("echo") and (len(line) == 4 or line[4] == " "):
             puts(line[5:] if len(line) > 4 else ""); newline()
         elif line == "pwd":
-            # 自检流里没有 cd，cwd 恒为根目录
-            puts("/"); newline()
+            puts(cwd[0]); newline()
+        elif line == "cd" or line.startswith("cd "):
+            p = abs_path(line[3:].strip() if len(line) > 3 else "/")
+            if p == "/":
+                cwd[0] = "/"
+            elif p == "/hd" or p.startswith("/hd/"):
+                if isinstance(e2_lookup(p[3:]), dict):
+                    cwd[0] = p
+                else:
+                    puts(msgs["msg_unknown"] + line); newline()
+            else:
+                t = tree_node(p)
+                if t and t[2][0] == "dir":
+                    cwd[0] = p
+                else:
+                    puts(msgs["msg_unknown"] + line); newline()
         elif line == "mount":
             for i, mnt in enumerate(mnts):
                 puts(fsnames[i] + " on " + mnt); newline()
@@ -474,7 +498,7 @@ def main():
             for name, v in e2root.items():
                 puts(name + ("/" if isinstance(v, dict) else "")); newline()
         elif line.startswith("stat ") and len(line) > 5:
-            r = vfs_resolve(line[5:])
+            r = vfs_resolve(abs_path(line[5:]))
             if r and r[2][0] < len(type_names):
                 tn = type_names[r[2][0]]
             else:
@@ -485,23 +509,44 @@ def main():
             else:
                 puts(msgs["msg_unknown"] + line); newline()
         elif line == "ls":
-            for name in sorted(root_dir):
-                kind = root_dir[name][0]
-                puts(name + ("/" if kind == "dir" else "")); newline()
+            if cwd[0] == "/":
+                for name in sorted(root_dir):
+                    kind = root_dir[name][0]
+                    puts(name + ("/" if kind == "dir" else "")); newline()
+            elif cwd[0] == "/hd" or cwd[0].startswith("/hd/"):
+                node = e2_lookup(cwd[0][3:])
+                if isinstance(node, dict):
+                    for name, v in node.items():
+                        puts(name + ("/" if isinstance(v, dict) else "")); newline()
+            else:
+                t = tree_node(cwd[0])
+                if t and t[2][0] == "dir":
+                    for name in sorted(t[2][1]):
+                        puts(name + ("/" if t[2][1][name][0] == "dir" else "")); newline()
         elif line.startswith("touch "):
-            par = tree_parent(line[6:])
+            par = tree_parent(abs_path(line[6:]))
             if par and par[1] not in par[0]:
                 par[0][par[1]] = ("file", b"")
         elif line.startswith("mkdir "):
-            par = tree_parent(line[6:])
+            par = tree_parent(abs_path(line[6:]))
             if par and par[1] not in par[0]:
                 par[0][par[1]] = ("dir", {})
         elif line.startswith("rm "):
-            par = tree_parent(line[3:])
-            if par and par[1] in par[0]:
-                del par[0][par[1]]
+            p = abs_path(line[3:])
+            if p == "/hd" or p.startswith("/hd/"):
+                parts = [c for c in p[3:].split("/") if c]
+                node = e2root
+                for c in parts[:-1]:
+                    node = node.get(c) if isinstance(node, dict) else None
+                if parts and isinstance(node, dict) and isinstance(node.get(parts[-1]), bytes):
+                    del node[parts[-1]]
+            else:
+                par = tree_parent(p)
+                if par and par[1] in par[0]:
+                    del par[0][par[1]]
         elif line.startswith("cp ") and len(line.split()) == 3:
             _, src, dst = line.split()
+            src, dst = abs_path(src), abs_path(dst)
             if dst == "/hd" or dst.startswith("/hd/"):
                 # FS4：cp 目标在 /hd → ext2 驱动（截断复用：同名覆盖、条目位置
                 # 不动 = dict 重赋值保持插入序，两边语义恰好一致）
@@ -526,12 +571,13 @@ def main():
                         par[0][par[1]] = ("dir", r[2] if r[2] is not None else {})
         elif line.startswith("mv ") and len(line.split()) == 3:
             _, src, dst = line.split()
+            src, dst = abs_path(src), abs_path(dst)
             sp = tree_parent(src)
             dp = tree_parent(dst)
             if sp and sp[1] in sp[0] and dp:
                 dp[0][dp[1]] = sp[0].pop(sp[1])
         elif line.startswith("cat ") and len(line) > 4:
-            path = line[4:]
+            path = abs_path(line[4:])
             if path == "/dev" or path.startswith("/dev/"):
                 # /dev 下的 cat 走 devfs 语义（空设备读到 EOF 无输出）
                 r = vfs_resolve(path)

@@ -74,7 +74,8 @@ VIA_WRITE      equ 8
 VIA_CLOSE      equ 12
 VIA_READDIR    equ 16
 VIA_CREATE     equ 20             ; FS4：创建（ESI=rel，EAX=kind）；槽 0 = 不支持
-VIA_LEN        equ 24
+VIA_UNLINK     equ 24             ; FS5：删除（ESI=rel）；槽 0 = 不支持
+VIA_LEN        equ 28
 
 ; devfs 设备号
 DEV_NULL       equ 0
@@ -320,6 +321,36 @@ vfs_create:
     ; 踩坑 25：这里绝不能「call eax」——上面为传参把 EAX 重载成了 kind，
     ; 会把刚取出的函数地址撞成 0，call 0x0 执行 IVT 垃圾 = #UD → 红杠挂死。
     ; 间接调用的目标寄存器和参数装载寄存器必须分开。
+    mov  [esp + 28], eax
+    popad
+    ret
+.supp:
+    mov  dword [fs_err], FS_NOTSUPP
+.out_bad:
+    mov  dword [esp + 28], 0
+    popad
+    ret
+
+; ============================================================================
+;  vfs_unlink：ESI = 路径 → EAX = 1/0（FS5）
+;  挂载匹配后交给驱动表的 VIA_UNLINK 列；槽是 0 就报 FS_NOTSUPP。
+;  MeFS 的删除不经这条路（命令层直接 fs_* 原语）。
+; ============================================================================
+vfs_unlink:
+    pushad
+    call fs_action
+    test eax, eax
+    jz   .out_bad
+    lea  esi, [path_buf]
+    call vfs_mount_match
+    test eax, eax
+    js   .out_bad                       ; fs_err 已设（FS_BADPATH）
+    imul eax, eax, VIA_LEN
+    mov  edx, [vfs_drv_tab + eax + VIA_UNLINK]
+    test edx, edx
+    jz   .supp
+    mov  esi, [vfs_mm_rel]
+    call edx
     mov  [esp + 28], eax
     popad
     ret
@@ -1021,9 +1052,9 @@ vfs_fsname_tab:
 
 ; 驱动函数表：每行 {open, read, write, close, readdir, create}，行号 = 驱动号
 vfs_drv_tab:
-    dd mefs_open,  mefs_read,  mefs_write,  mefs_close,  mefs_readdir,  0            ; DRV_MEFS（MeFS 的创建走 fs_* 原语，不经驱动）
-    dd dev_open,   dev_read,   dev_write,   dev_close,   dev_readdir,   0            ; DRV_DEV
-    dd ext2_open,  ext2_read,  ext2_write,  ext2_close,  ext2_readdir,  ext2_create  ; DRV_EXT2
+    dd mefs_open,  mefs_read,  mefs_write,  mefs_close,  mefs_readdir,  0, 0            ; DRV_MEFS（MeFS 的创建/删除走 fs_* 原语，不经驱动）
+    dd dev_open,   dev_read,   dev_write,   dev_close,   dev_readdir,   0, 0            ; DRV_DEV
+    dd ext2_open,  ext2_read,  ext2_write,  ext2_close,  ext2_readdir,  ext2_create, ext2_unlink  ; DRV_EXT2
 
 mnt_root       db "/", 0
 mnt_dev        db "/dev", 0

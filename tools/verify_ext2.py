@@ -21,18 +21,16 @@ FS3 断言（ext2 只读）：
   D_EXT2_ERR   == 0   —— 无 FS_* 错误码残留
   D_EXT2_CMD   >= 3   —— 三个命令都进过驱动
 
-FS4 断言（ext2 写，vmem 侧）：
+FS4/FS5 断言（ext2 写/删，vmem 侧）：
   D_EXT2_STAGE >= 6   —— 写路径真跑通（cp 落盘）
-  D_EXT2_FREE  == 真值-1 —— cp 分配了 1 个数据块（截断复用则不新分配，二次
-                        开机幂等：盘上已有 c1.txt，FREE 停在 真值-1 不再降）
+  D_EXT2_FREE  == 真值 —— 自检流 cp 分配 1 块后又 rm 释放，回到基线（二次
+                        开机同样幂等：先截断复用、再删除）
 
-FS4 断言（disk 侧，关机后）：
-  /hd/c1.txt 存在（ino=16；lost+found 占 15，bit15）
-  内容 == src/ramfs/hello.txt（cp 的源）
-  块位图 +bit42（=块 43，c1.txt 数据块——位 i 对应块 i+1 的移位约定；
-  lost+found 的块 42 = bit 41）、inode 位图 +bit15、
-  超块/GD free 计数已落盘
-  根目录块条目游走无缝覆盖到 1024（rec_len 洞回归检查）
+FS5 断言（disk 侧，关机后）：
+  /hd/c1.txt 已不存在（目录条目 ino 清零；rec_len 链仍无缝）
+  ino 16（c1.txt 用过的号）已清零；块 43 的位图位 bit42 已释放；
+  inode 位图 bit15 已释放；超块/GD free 计数回到镜像基线
+  /hd/hello.txt 未被误伤
 """
 
 import glob
@@ -144,47 +142,40 @@ def check_disk():
         ents, end = walk_root(fp, 1024, root_blk)
 
         bad = []
-        c1 = ents.get("c1.txt")
-        if not c1:
-            print("结果：FAIL（根目录没有 c1.txt：%s）" % sorted(ents))
-            return 1
-        # lost+found 占 15（mkext2 注入的标准配件目录），c1.txt = 16
-        # = 下一个非保留空闲 inode（位 bit15；mkext2 占 1..15）
-        if c1 != 16:
-            bad.append("c1.txt ino=%d，期望 16（lost+found 占 15 后第一个空闲号）" % c1)
-        fp.seek(inotab * 1024 + (c1 - 1) * 128)
+        if "c1.txt" in ents:
+            bad.append("根目录仍有 c1.txt（rm 没摘掉条目）：%s" % sorted(ents))
+        hello = ents.get("hello.txt")
+        if not hello:
+            bad.append("根目录丢了 hello.txt：%s" % sorted(ents))
+        else:
+            fp.seek(inotab * 1024 + (hello - 1) * 128)
+            hi = fp.read(128)
+            hsize = struct.unpack("<I", hi[0x04:0x08])[0]
+            if hsize == 0:
+                bad.append("hello.txt size=0（被误伤）")
+        # c1.txt 用过的 ino=16（lost+found 占 15 后第一个空闲号）/ 数据块 43
+        fp.seek(inotab * 1024 + (16 - 1) * 128)
         ino = fp.read(128)
-        size = struct.unpack("<I", ino[0x04:0x08])[0]
         links = struct.unpack("<H", ino[0x1A:0x1C])[0]
         mode = struct.unpack("<H", ino[0x00:0x02])[0]
-        dblk = struct.unpack("<I", ino[0x28:0x2C])[0]
-        print("c1.txt: ino=%d mode=0x%X links=%d size=%d blk=%d"
-              % (c1, mode, links, size, dblk))
-        if mode & 0xF000 != 0x8000:
-            bad.append("c1.txt mode 非 reg")
-        if links != 1:
-            bad.append("c1.txt links=%d，期望 1" % links)
-        src = open(os.path.join(ROOT, "src", "ramfs", "hello.txt"), "rb").read()
-        if size != len(src):
-            bad.append("c1.txt size=%d，期望 %d（= MeFS /hello.txt）" % (size, len(src)))
-        fp.seek(dblk * 1024)
-        data = fp.read(1024)[:size]
-        if data != src:
-            bad.append("c1.txt 内容 != src/ramfs/hello.txt（前 16B %r）" % data[:16])
-        # 位图：块 bit dblk-1（bit i ↔ 块 i+1）、inode bit c1-1
+        print("ino16 after rm: mode=0x%X links=%d" % (mode, links))
+        if links != 0 or mode != 0:
+            bad.append("ino 16 未清干净：mode=0x%X links=%d" % (mode, links))
+        # 位图：块 bit 42 ↔ 块 43（bit i ↔ 块 i+1）、inode bit 15 ↔ ino 16
         fp.seek(3 * 1024)
         bb = fp.read(1024)
-        if not (bb[(dblk - 1) // 8] >> ((dblk - 1) % 8)) & 1:
-            bad.append("块位图没置 bit%d（c1.txt 数据块 %d）" % (dblk - 1, dblk))
+        if (bb[42 // 8] >> (42 % 8)) & 1:
+            bad.append("块位图仍置 bit42（块 43 没释放）")
         fp.seek(4 * 1024)
         ib = fp.read(1024)
-        if not (ib[(c1 - 1) // 8] >> ((c1 - 1) % 8)) & 1:
-            bad.append("inode 位图没置 bit%d（c1.txt 的 ino-1）" % (c1 - 1))
-        # free 计数落盘
-        if free != free0 - 1:
-            bad.append("超块 free_blocks=%d，期望 %d（真值-1）" % (free, free0 - 1))
-        if free_ino != free_ino0 - 1:
-            bad.append("超块 free_inodes=%d，期望 %d" % (free_ino, free_ino0 - 1))
+        if (ib[15 // 8] >> (15 % 8)) & 1:
+            bad.append("inode 位图仍置 bit15（ino 16 没释放）")
+        # free 计数落盘：rm 后应回到镜像基线
+        if free != free0:
+            bad.append("超块 free_blocks=%d，期望 %d（rm 后回基线）" % (free, free0))
+        if free_ino != free_ino0:
+            bad.append("超块 free_inodes=%d，期望 %d（rm 后回基线）"
+                       % (free_ino, free_ino0))
         # 目录块无缝覆盖（rec 洞回归检查）
         if end != 1024:
             bad.append("根目录游走停在 %d（期望 1024：有 rec_len 洞！）" % end)
@@ -194,7 +185,7 @@ def check_disk():
         for b in bad:
             print("  - " + b)
         return 1
-    print("结果：PASS（FS4 落盘：c1.txt 内容/位图/计数/目录无缝 全对）")
+    print("结果：PASS（FS5 落盘：c1.txt 删除、块/inode 回收、计数回基线、目录无缝）")
     return 0
 
 
@@ -238,9 +229,9 @@ def main():
     if d["D_EXT2_STAGE"] < 6:
         bad.append("D_EXT2_STAGE=%d，没到 6（6 = cp 写路径落盘完成）"
                    % d["D_EXT2_STAGE"])
-    if d["D_EXT2_FREE"] != free - 1:
-        bad.append("D_EXT2_FREE=%d，期望 %d（真值-1；二次开机截断复用不新分配）"
-                   % (d["D_EXT2_FREE"], free - 1))
+    if d["D_EXT2_FREE"] != free:
+        bad.append("D_EXT2_FREE=%d，期望 %d（cp 后又 rm，应回到真值）"
+                   % (d["D_EXT2_FREE"], free))
     # ---- 全程无 CPU 异常（idt 向量记录器，见技术文档 §5/§12.5）----
     vec = d["D_EXVEC"] & 0xFF
     if vec != 0:
@@ -251,7 +242,7 @@ def main():
         for b in bad:
             print("  - " + b)
         return 1
-    print("结果：PASS（FS2：ATA；FS3：只读；FS4：写路径 + 分配记账）")
+    print("结果：PASS（FS2：ATA；FS3：只读；FS4：写；FS5：unlink 回收记账）")
     return 0
 
 

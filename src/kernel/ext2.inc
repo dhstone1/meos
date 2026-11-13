@@ -14,6 +14,7 @@
 ;    · 直接块 0..11 + 一级间接 12..267（文件上限 268 块 = 274432 B）
 ;    · 目录只走直接块（1 块 = 1024 B，够 8 MB 盘用）
 ;    · 类型只认 reg(0x8)/dir(0x4)，symlink 等报 FS_NOTSUPP
+;    · 删除只认普通文件（FS5 的 unlink；目录报 FS_ISDIR，留给 rmdir）
 ; ============================================================================
 
 ; ---- 常量 -------------------------------------------------------------------
@@ -805,6 +806,67 @@ ext2_bitmap_alloc:
     popad
     ret
 
+; ---- ext2_bitmap_free：EAX = 位图块号，ECX = 位号 → EAX = 1/0 -----------------
+;  只清位并写回位图块；空闲计数由调用方改（alloc 的反向操作）
+ext2_bitmap_free:
+    pushad
+    mov  [e2bm_blk], eax
+    mov  [e2bm_bit], ecx
+    call ext2_read_block
+    test eax, eax
+    jz   .io
+    mov  eax, [e2bm_bit]
+    mov  ebx, eax
+    shr  ebx, 3                         ; 字节下标
+    and  eax, 7                         ; 位内下标
+    mov  dl, 1
+    mov  cl, al
+    shl  dl, cl
+    not  dl
+    and  [ext2_blk_buf + ebx], dl
+    mov  eax, [e2bm_blk]
+    shl  eax, 1                         ; 块号 × 2 = LBA
+    mov  ecx, 2
+    mov  esi, ext2_blk_buf
+    call ata_write_sectors
+    test eax, eax
+    jz   .io
+    mov  dword [esp + 28], 1
+    popad
+    ret
+.io:
+    mov  dword [fs_err], FS_IO
+.fail:
+    mov  eax, [fs_err]
+    mov  [DIAG_ADDR + D_EXT2_ERR], eax
+    mov  dword [esp + 28], 0
+    popad
+    ret
+
+; ---- ext2_free_block：EAX = 块号 → 清位图 bit(块号-1) 并 free+1 --------------
+;  EAX = 0 当作本来就没有块，直接成功跳过
+ext2_free_block:
+    pushad
+    test eax, eax
+    jz   .ok
+    dec  eax                            ; 块号 → 位号（bit i ↔ 块 i+1）
+    mov  ecx, eax
+    mov  eax, E2_BBMP
+    call ext2_bitmap_free
+    test eax, eax
+    jz   .fail
+    inc  dword [ext2_sb_free]
+    mov  eax, [ext2_sb_free]
+    mov  [DIAG_ADDR + D_EXT2_FREE], eax
+.ok:
+    mov  dword [esp + 28], 1
+    popad
+    ret
+.fail:
+    mov  dword [esp + 28], 0
+    popad
+    ret
+
 ; ---- ext2_alloc_block → EAX = 新块号（0 = 满了/IO 错）-----------------------
 ;  成功时 ext2_sb_free 已减一（D_EXT2_FREE 跟着走），落盘靠 sync_super
 ;  标准（first_data_block=1）：块位图 bit i ↔ 块 i+1，块 0（引导区）不占位图
@@ -1276,6 +1338,295 @@ ext2_create:
     popad
     ret
 
+; ---- ext2_unlink：ESI = 相对路径 → EAX = 1/0（FS5：只删普通文件）-------------
+;  顺序：读目录条目 → 目标 inode 清空落盘 → 释放数据块 → 释放 inode 位图 →
+;  目录条目 inode 清零 → 空闲计数落盘。先清 inode 再放块，崩溃最坏是漏块，
+;  不会出现 inode 指着已经分出去的块（e2fsck 能修漏块）。
+ext2_unlink:
+    pushad
+    cld
+    cmp  dword [ext2_ready], 1
+    jne  .notrdy
+    inc  dword [DIAG_ADDR + D_EXT2_CMD]
+    ; ---- 1. 拷路径（只剥串首的 '/'）----
+    mov  edi, e2un_path
+.copy:
+    lodsb
+    test al, al
+    jz   .copied
+    cmp  al, '/'
+    jne  .st
+    cmp  edi, e2un_path
+    je   .copy
+.st:
+    stosb
+    jmp  .copy
+.copied:
+    xor  al, al
+    stosb
+    ; ---- 2. 拆父路径 + 末组件（和 ext2_create 同构）----
+    mov  esi, e2un_path
+    xor  edx, edx
+.find:
+    lodsb
+    test al, al
+    jz   .found
+    cmp  al, '/'
+    jne  .find
+    lea  eax, [esi - 1]
+    sub  eax, e2un_path
+    mov  edx, eax
+    jmp  .find
+.found:
+    test edx, edx
+    jz   .root_case
+    lea  esi, [e2un_path + edx + 1]
+    mov  edi, e2un_name
+    xor  ecx, ecx
+.ncopy:
+    lodsb
+    test al, al
+    jz   .ndone
+    stosb
+    inc  ecx
+    jmp  .ncopy
+.ndone:
+    test ecx, ecx
+    jz   .noname
+    mov  [e2un_nlen], ecx
+    cmp  ecx, 31
+    ja   .namelen
+    mov  byte [e2un_path + edx], 0
+    mov  eax, EXT2_ROOT_INO
+    mov  esi, e2un_path
+    call ext2_lookup
+    test eax, eax
+    jz   .fail
+    mov  [e2un_dir], eax
+    jmp  .have_parent
+.root_case:
+    mov  esi, e2un_path
+    mov  edi, e2un_name
+    xor  ecx, ecx
+.rcopy:
+    lodsb
+    test al, al
+    jz   .rdone
+    stosb
+    inc  ecx
+    jmp  .rcopy
+.rdone:
+    test ecx, ecx
+    jz   .noname
+    mov  [e2un_nlen], ecx
+    cmp  ecx, 31
+    ja   .namelen
+    mov  dword [e2un_dir], EXT2_ROOT_INO
+.have_parent:
+    ; 点与点点绝不允许删
+    cmp  dword [e2un_nlen], 1
+    jne  .not_dot
+    cmp  byte [e2un_name], '.'
+    je   .badname
+.not_dot:
+    cmp  dword [e2un_nlen], 2
+    jne  .scan_start
+    cmp  word [e2un_name], 0x2E2E
+    je   .badname
+.scan_start:
+    ; ---- 3. 扫父目录（直接块），定位条目（记块号 + 块内偏移）----
+    mov  eax, [e2un_dir]
+    call ext2_read_inode
+    test eax, eax
+    jz   .fail
+    movzx eax, word [ext2_ino_buf + I_MODE]
+    shr  eax, 12
+    cmp  eax, 4
+    jne  .notdir
+    mov  eax, [ext2_ino_buf + I_SIZE]
+    mov  [e2un_size], eax
+    mov  dword [e2un_pos], 0
+.scan:
+    mov  eax, [e2un_pos]
+    cmp  eax, [e2un_size]
+    jae  .noent
+    mov  edx, eax
+    shr  edx, 10
+    cmp  edx, E2_MAX_DIRECT
+    jae  .supp
+    mov  eax, [ext2_ino_buf + I_BLOCK + edx * 4]
+    test eax, eax
+    jz   .noent
+    mov  [e2un_blk], eax
+    call ext2_read_block
+    test eax, eax
+    jz   .io
+    mov  edx, [e2un_pos]
+    and  edx, 0x3FF
+    mov  [e2un_off], edx
+    mov  esi, ext2_blk_buf
+    add  esi, edx
+    mov  eax, [esi + ED2_INO]
+    mov  [e2un_ino], eax
+    movzx ecx, word [esi + ED2_REC]
+    cmp  ecx, 8
+    jb   .corrupt
+    test ecx, 3
+    jnz  .corrupt
+    mov  [e2un_rec], ecx
+    mov  edx, [e2un_pos]
+    add  edx, ecx
+    mov  [e2un_pos], edx               ; 先推进游标
+    cmp  dword [e2un_ino], 0
+    je   .scan                         ; 空洞
+    movzx ecx, byte [esi + ED2_NAMELEN]
+    cmp  ecx, [e2un_nlen]
+    jne  .scan
+    mov  edx, [e2un_off]
+    lea  esi, [ext2_blk_buf + edx + ED2_NAME]
+    lea  edi, [e2un_name]
+    xor  ecx, ecx
+.cmp:
+    mov  al, [esi + ecx]
+    cmp  al, [edi + ecx]
+    jne  .scan
+    inc  ecx
+    cmp  ecx, [e2un_nlen]
+    jb   .cmp
+    ; ---- 4. 目标 inode：只认普通文件 ----
+    mov  eax, [e2un_ino]
+    call ext2_read_inode
+    test eax, eax
+    jz   .fail
+    movzx eax, word [ext2_ino_buf + I_MODE]
+    shr  eax, 12
+    cmp  eax, 8
+    je   .isfile
+    cmp  eax, 4
+    je   .isdir
+    jmp  .supp
+.isfile:
+    ; ---- 5. 释放数据块（先直接块，再一级间接）----
+    xor  ebx, ebx
+.free_direct:
+    mov  eax, [ext2_ino_buf + I_BLOCK + ebx * 4]
+    test eax, eax
+    jz   .next_direct
+    call ext2_free_block
+    test eax, eax
+    jz   .io
+.next_direct:
+    inc  ebx
+    cmp  ebx, E2_MAX_DIRECT
+    jb   .free_direct
+    mov  eax, [ext2_ino_buf + I_BLOCK + 12 * 4]
+    test eax, eax
+    jz   .blocks_done
+    mov  [e2un_tmp], eax
+    ; 间接块先抄进 ind_buf：free 会重读位图块，blk_buf 不能当遍历源
+    mov  eax, [e2un_tmp]
+    call ext2_read_block
+    test eax, eax
+    jz   .io
+    mov  esi, ext2_blk_buf
+    mov  edi, ext2_ind_buf
+    mov  ecx, 256
+    rep  movsd
+    xor  ebx, ebx
+.free_ind:
+    mov  eax, [ext2_ind_buf + ebx * 4]
+    test eax, eax
+    jz   .next_ind
+    call ext2_free_block
+    test eax, eax
+    jz   .io
+.next_ind:
+    inc  ebx
+    cmp  ebx, 256
+    jb   .free_ind
+    mov  eax, [e2un_tmp]
+    call ext2_free_block
+    test eax, eax
+    jz   .io
+.blocks_done:
+    ; ---- 6. inode 清零落盘（links=0；dtime 必须留 0——非 0 会被 e2fsck
+    ; 当成 orphan 链的 next 指针，报 corrupted orphan linked list）----
+    mov  edi, ext2_ino_buf
+    xor  eax, eax
+    mov  ecx, 32
+    rep  stosd
+    mov  eax, [e2un_ino]
+    call ext2_write_inode
+    test eax, eax
+    jz   .io
+    ; ---- 7. 释放 inode 位图 ----
+    mov  eax, [e2un_ino]
+    dec  eax
+    mov  ecx, eax
+    mov  eax, E2_IBM
+    call ext2_bitmap_free
+    test eax, eax
+    jz   .io
+    inc  dword [ext2_sb_free_ino]
+    ; ---- 8. 目录条目 inode 清零（rec_len 链原样保留）----
+    mov  eax, [e2un_blk]
+    call ext2_read_block
+    test eax, eax
+    jz   .io
+    mov  edi, ext2_blk_buf
+    add  edi, [e2un_off]
+    mov  dword [edi + ED2_INO], 0
+    mov  eax, [e2un_blk]
+    shl  eax, 1
+    mov  ecx, 2
+    mov  esi, ext2_blk_buf
+    call ata_write_sectors
+    test eax, eax
+    jz   .io
+    call ext2_sync_super
+    test eax, eax
+    jz   .io
+    mov  dword [fs_err], FS_OK
+    mov  dword [DIAG_ADDR + D_EXT2_ERR], 0
+    mov  dword [esp + 28], 1
+    popad
+    ret
+.noname:
+    mov  dword [fs_err], FS_BADPATH
+    jmp  .fail
+.badname:
+    mov  dword [fs_err], FS_BADPATH
+    jmp  .fail
+.namelen:
+    mov  dword [fs_err], FS_NAMELEN
+    jmp  .fail
+.noent:
+    mov  dword [fs_err], FS_NOENT
+    jmp  .fail
+.notdir:
+    mov  dword [fs_err], FS_NOTDIR
+    jmp  .fail
+.isdir:
+    mov  dword [fs_err], FS_ISDIR
+    jmp  .fail
+.supp:
+    mov  dword [fs_err], FS_NOTSUPP
+    jmp  .fail
+.corrupt:
+    mov  dword [fs_err], FS_IO
+    jmp  .fail
+.notrdy:
+    mov  dword [fs_err], FS_IO
+    jmp  .fail
+.io:
+    mov  dword [fs_err], FS_IO
+.fail:
+    mov  eax, [fs_err]
+    mov  [DIAG_ADDR + D_EXT2_ERR], eax
+    mov  dword [esp + 28], 0
+    popad
+    ret
+
 ; ---- ext2_write：ESI = fd 槽，EDI = 缓冲，ECX = 长度 → EAX = 字节数 ---------
 ;  只走直接块（v1 文件上限 12KB）；追加语义；写通后 D_EXT2_STAGE = 6
 ext2_write:
@@ -1487,6 +1838,18 @@ e2ci_ino        dd 0            ; 新 inode
 e2ci_blk        dd 0            ; 目录数据块号
 e2ci_need       dd 0            ; 新条目字节数
 e2ci_dblk       dd 0            ; 新目录自己的数据块
+
+e2un_path       times 64 db 0   ; unlink 相对路径拷贝
+e2un_name       times 40 db 0   ; 末组件名
+e2un_nlen       dd 0
+e2un_dir        dd 0            ; 父目录 ino
+e2un_ino        dd 0            ; 目标 ino
+e2un_size       dd 0            ; 父目录字节界
+e2un_pos        dd 0            ; 目录扫描游标
+e2un_blk        dd 0            ; 条目所在块
+e2un_off        dd 0            ; 条目块内偏移
+e2un_rec        dd 0            ; 条目 rec_len
+e2un_tmp        dd 0            ; 间接块号暂存
 
 e2wr_fd         dd 0
 e2wr_src        dd 0

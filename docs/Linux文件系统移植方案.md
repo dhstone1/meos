@@ -243,6 +243,11 @@ VFS（vfs.inc）：挂载表 → 最长前缀匹配 → 驱动号
   全绿不受影响。vfs_cwd 上收连同 `cd /hd` 支持**留给 FS5**，理由是
   D6 自己说的"伤筋动骨、单独排"——验收全绿的系统上为无验收项的重构
   重开工程风险，违反本方案的顺序纪律。
+  **实施记录（2026-11-13）：`cd /hd` 已支持，走轻量版**——`cmd_do_cd` 用
+  `vfs_open` 校验目标是 `VN_DIR` 后，把规范化路径拷入现有 `cwd_buf`；
+  `cwd_buf` 仍在 fs.inc，`fs_action` 仍按字符串拼相对路径，**没有**引入
+  `vfs_cwd`。因此 MeFS 的相对路径语义不变，`/hd` 相对路径与 `..` 仍不支持。
+  真实的 `vfs_cwd` 上收（含 `..`、跨挂载语义）继续列为 FS5 剩余项，属可选重构。
 
 **D7 写支持 write-through + 固定写序（数据 → 位图 → inode → 目录条目 → 超块/GD），无日志。**
 - 每次 cp/mkdir/touch 立即落盘（无缓存可脏）。崩溃时最坏丢一个刚建的文件或
@@ -504,7 +509,8 @@ vfs_drv_tab:
 - `ls` 重写为 vfs_readdir 版（§D5），`/dev` 特例删除；
 - `df` 加 `/hd` 行（读 D_EXT2_FREE）；
 - FS4：`cp` 目标 `/hd/...` 分支到 ext2 写路径；`touch/mkdir` 同理；
-  `rm` 只做 MeFS（ext2 的 unlink 留 FS5）；
+  `rm` 的 `/hd` 分支走 `vfs_unlink` → `ext2_unlink`（FS5 首批，2026-11-13），
+  MeFS 仍走原有删除路径；
 - `msg_help` 更新加 `disk`；`selftest_data` 追加
   `ls /hd`、`cat /hd/hello.txt`、`stat /hd/hello.txt`（FS4 再追加
   `cp /hello.txt /hd/c1.txt`、`cat /hd/c1.txt`）的扫描码，
@@ -642,7 +648,8 @@ tools/checkdoc.py 的 CONSTS——mkfloppy.py 没有 LOADER_SECTORS 常量
 | **FS2** ✅ 2026-10-20 | ATA PIO | ata.inc、`disk` 命令、D_ATA_* | ~350 行 asm + ~40 行 kernel |
 | **FS3** ✅ 2026-10-20 | ext2 只读 + readdir | ext2.inc(读)、vfs 5 列驱动表、`/hd` 挂载、ls 重写、selftest 扩展 | ~750 行 asm |
 | **FS4** ✅ 2026-10-21 | ext2 写 | ext2 写路径（create/write/位图/dir_insert/sync_super）、cp/touch/mkdir 跨挂载、VIA_CREATE 第 6 列、e2fsck 标准对齐 | ~650 行 asm |
-| **FS5** | （未来） | vfs_cwd 上收 + `cd /hd`（D6 留尾）、双间接块、rev 1 / 4096 块 / 多组、symlink、unlink、运行时 mount、df 跨 fs、mkext2 `--from-mke2fs`（§9.2 "进"方向） | 不承诺 |
+| **FS5 首批** ✅ 2026-11-13 | ext2 目录语义与删除 | `cd /hd`（轻量 cwd，`cwd_buf` 不搬）+ `rm /hd/...`（`vfs_unlink` → `ext2_unlink`：直接块/一级间接块、inode、目录条目回收） | ~180 行 asm + 验证脚本 |
+| **FS5 剩余** | 深度重构与扩展 | 真正的 `vfs_cwd` 上收（`..`、跨挂载相对路径）、双间接块、rev 1 / 4096 块 / 多组、symlink、运行时 mount、df 跨 fs、mkext2 `--from-mke2fs`（§9.2 "进"方向） | 不承诺 |
 
 顺序不能乱：FS1 完全不碰内核（风险零，先把"裁判"备好——ext2check 和 e2fsck
 是后面所有阶段的地面真值）；FS2 有了 `disk` 命令就能人肉看盘；FS3 读通了
